@@ -6,7 +6,7 @@ Usage:
     python scripts/predict.py --date 2026-05-25 --venue HV --race 3
 """
 
-import argparse, json, pickle, sys
+import argparse, json, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -20,13 +20,12 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MODEL_DIR, DATA_DIR, ALL_FEATURES, RACE_TIME_BY_DIST, RACE_TIME_DEFAULT
-from db import init_db, get_racecard, get_horses, get_latest_odds, save_predictions, get_race_ids_for_date, get_db
+from db import init_db, get_racecard, get_latest_odds, save_predictions, get_race_ids_for_date, get_db, save_bet, get_bankroll
 
-LGB_PATH    = MODEL_DIR / "model_lgb.txt"
-XGB_PATH    = MODEL_DIR / "model_xgb.json"
-CAT_PATH    = MODEL_DIR / "model_cat.cbm"
-ENCODER_PATH = MODEL_DIR / "xgb_encoder.pkl"
-META_PATH   = MODEL_DIR / "model_meta.json"
+LGB_PATH  = MODEL_DIR / "model_lgb.txt"
+XGB_PATH  = MODEL_DIR / "model_xgb.json"
+CAT_PATH  = MODEL_DIR / "model_cat.cbm"
+META_PATH = MODEL_DIR / "model_meta.json"
 
 MATRIX_PATH = Path(__file__).resolve().parent.parent / "training_data" / "final_feature_matrix.parquet"
 AI_CACHE = DATA_DIR / "ai_sentiment_cache.parquet"
@@ -40,10 +39,39 @@ def _load_models():
     xgb_model = xgb.Booster()
     xgb_model.load_model(str(XGB_PATH))
     cat_model = CatBoost().load_model(str(CAT_PATH))
-    xgb_enc = pickle.load(open(str(ENCODER_PATH), "rb"))
     with open(META_PATH) as f:
         meta = json.load(f)
-    return lgb_model, xgb_model, cat_model, xgb_enc, meta["features"]
+    trained_at = meta.get("trained_at")
+    if trained_at:
+        try:
+            days_old = (datetime.now() - datetime.fromisoformat(trained_at)).days
+            if days_old > 60:
+                logger.warning(f"Models are {days_old} days old (trained {trained_at}) — consider retraining")
+        except Exception:
+            pass
+    return lgb_model, xgb_model, cat_model, meta["features"]
+
+
+def _load_wet_dry_stats(df: pd.DataFrame) -> dict:
+    """Compute per-horse wet/dry win rates from the feature matrix."""
+    cond_col = next((c for c in ["track_condition", "going"] if c in df.columns), None)
+    pos_col = next((c for c in ["finish_pos", "plc", "position", "place"] if c in df.columns), None)
+    if not cond_col or not pos_col or "horse_id" not in df.columns:
+        return {}
+    df = df[["horse_id", cond_col, pos_col]].copy()
+    df["_wet"] = df[cond_col].astype(str).str.upper().str.contains("WET|SOFT|YIELD|HEAVY|SLOW", na=False)
+    df["_won"] = pd.to_numeric(df[pos_col], errors="coerce") == 1
+    stats = {}
+    for horse_id, grp in df.groupby("horse_id"):
+        wet = grp[grp["_wet"]]
+        dry = grp[~grp["_wet"]]
+        stats[horse_id] = {
+            "wet_wr": round(wet["_won"].mean(), 3) if len(wet) >= 3 else None,
+            "wet_runs": len(wet),
+            "dry_wr": round(dry["_won"].mean(), 3) if len(dry) >= 3 else None,
+            "dry_runs": len(dry),
+        }
+    return stats
 
 
 def _load_historical_stats():
@@ -53,7 +81,8 @@ def _load_historical_stats():
     h_cols = ["horse_id", "sec_pos_1", "sec_pos_2", "sec_pos_pre"]
     h_cols_exist = [c for c in h_cols if c in df.columns]
     h_stats = df.sort_values("date").groupby("horse_id").tail(1)[h_cols_exist]
-    return j_stats, t_stats, h_stats
+    wet_dry_stats = _load_wet_dry_stats(df)
+    return j_stats, t_stats, h_stats, wet_dry_stats
 
 
 def _load_ai_scores(df_full):
@@ -78,8 +107,8 @@ def _normalize(s):
     return (s - mn) / (mx - mn + 1e-9)
 
 
-def predict_race(race_id: str, lgb_model, xgb_model, cat_model, xgb_enc, features,
-                 j_stats, t_stats, h_stats, ai_scores) -> dict | None:
+def predict_race(race_id: str, lgb_model, xgb_model, cat_model, features,
+                 j_stats, t_stats, h_stats, ai_scores, wet_dry_stats: dict) -> dict | None:
     rc = get_racecard(race_id)
     if not rc:
         logger.warning(f"{race_id}: racecard not found in DB")
@@ -92,6 +121,25 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, xgb_enc, feature
     field_size = len(horses)
     venue = rc.get("venue", "ST")
     odds = get_latest_odds(race_id)
+
+    # ── Batch-load previous gear/trainer for gear_change & stable_change ────
+    horse_ids = [h.get("horse_id", "") for h in horses if h.get("horse_id")]
+    prev_data: dict = {}
+    if horse_ids:
+        conn_prev = get_db()
+        placeholders = ",".join("?" * len(horse_ids))
+        prev_rows = conn_prev.execute(
+            f"SELECT h.horse_id, h.gear, h.trainer FROM horses h "
+            f"JOIN racecards r ON h.race_id = r.race_id "
+            f"WHERE h.horse_id IN ({placeholders}) AND h.race_id != ? "
+            f"ORDER BY h.horse_id, r.date DESC",
+            horse_ids + [race_id]
+        ).fetchall()
+        conn_prev.close()
+        for row in prev_rows:
+            hid = row["horse_id"]
+            if hid not in prev_data:
+                prev_data[hid] = {"gear": row["gear"] or "", "trainer": row["trainer"] or ""}
 
     rows = []
     for h in horses:
@@ -128,8 +176,8 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, xgb_enc, feature
             "last_6_best": min(last_6) if last_6 else 5.0,
             "last_2_avg": np.mean(last_6[:2]) if len(last_6) >= 2 else 7.0,
             "last_6_trend": (np.mean(last_6[:3]) - np.mean(last_6[3:])) if len(last_6) >= 6 else 0.0,
-            "gear_change": 0.0,
-            "stable_change": 0,
+            "gear_change": 1.0 if (prev_data.get(horse_id, {}).get("gear", "") != (h.get("gear", "") or "") and horse_id in prev_data) else 0.0,
+            "stable_change": 1 if (prev_data.get(horse_id, {}).get("trainer", "") != trainer and horse_id in prev_data) else 0,
             "ai_unluckiness": ai_scores.get(horse_id, 1.0),
             "jockey_win_rate": js.get("jockey_win_rate", 0.08),
             "jockey_place_rate": js.get("jockey_place_rate", 0.23),
@@ -186,6 +234,31 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, xgb_enc, feature
     bet = None
     if not wet and not value.empty and not odds_defaulted:
         bet = value.sort_values("pure_ev", ascending=False).iloc[0]
+        # Wet/dry track fitness warning
+        bet_horse_id = None
+        for h in horses:
+            if str(h.get("saddle_number", "")) == str(bet["horse_no"]):
+                bet_horse_id = h.get("horse_id", "")
+                break
+        if bet_horse_id and bet_horse_id in wet_dry_stats:
+            wd = wet_dry_stats[bet_horse_id]
+            if wd["dry_wr"] is not None:
+                logger.info(f"  #{bet['horse_no']} wet/dry: dry_wr={wd['dry_wr']:.3f}({wd['dry_runs']}r) wet_wr={wd.get('wet_wr','N/A')}")
+        prob = float(bet["pred_prob"])
+        odds_val = float(bet["win_odds"])
+        kelly = (prob * odds_val - 1) / (odds_val - 1) if odds_val > 1 else 0
+        bankroll = get_bankroll()
+        stake = max(0, kelly * 0.25) * bankroll["balance"] * 0.02
+        stake = round(min(stake, bankroll["balance"] * 0.05), 2)
+        if stake > 0:
+            conn = get_db()
+            existing = conn.execute(
+                "SELECT id FROM bets WHERE race_id = ? AND horse_no = ? AND result IS NULL",
+                (race_id, str(bet["horse_no"]))
+            ).fetchone()
+            conn.close()
+            if not existing:
+                save_bet(race_id, str(bet["horse_no"]), stake, odds_val)
 
     top = df.sort_values("rank").iloc[0]
     return {
@@ -218,10 +291,10 @@ def main():
         return
 
     logger.info("Loading models...")
-    lgb_model, xgb_model, cat_model, xgb_enc, features = _load_models()
+    lgb_model, xgb_model, cat_model, features = _load_models()
     logger.info("Loading historical stats...")
     df_full = pd.read_parquet(MATRIX_PATH)
-    j_stats, t_stats, h_stats = _load_historical_stats()
+    j_stats, t_stats, h_stats, wet_dry_stats = _load_historical_stats()
     ai_scores = _load_ai_scores(df_full)
 
     if args.race > 0:
@@ -236,8 +309,8 @@ def main():
     results = []
     for rid in race_ids:
         try:
-            r = predict_race(rid, lgb_model, xgb_model, cat_model, xgb_enc, features,
-                             j_stats, t_stats, h_stats, ai_scores)
+            r = predict_race(rid, lgb_model, xgb_model, cat_model, features,
+                             j_stats, t_stats, h_stats, ai_scores, wet_dry_stats)
             if r:
                 results.append(r)
                 tp = r["top_pick"]

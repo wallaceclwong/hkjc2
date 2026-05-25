@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS horses (
     training_location TEXT DEFAULT 'HK',
     last_6_json TEXT,
     odds_json TEXT,
+    weight_allowance REAL DEFAULT 0,
     UNIQUE(race_id, horse_no)
 );
 
@@ -156,6 +157,11 @@ def init_db():
             "INSERT INTO bankroll (id, balance, high_water_mark, updated_at) VALUES (1, 10000, 10000, ?)",
             (datetime.now().isoformat(),)
         )
+    # Migrate: add weight_allowance to existing horses tables
+    try:
+        conn.execute("ALTER TABLE horses ADD COLUMN weight_allowance REAL DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -180,11 +186,11 @@ def save_racecard(race_id: str, date: str, venue: str, race_no: int,
         last6 = json.dumps(h.get("last_6_runs", []))
         odds = json.dumps({"win": h.get("win_odds"), "place": h.get("place_odds")})
         conn.execute(
-            "INSERT OR REPLACE INTO horses (race_id, horse_no, horse_name, horse_id, jockey, trainer, draw, weight, gear, training_location, last_6_json, odds_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO horses (race_id, horse_no, horse_name, horse_id, jockey, trainer, draw, weight, gear, training_location, last_6_json, odds_json, weight_allowance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (race_id, str(h["saddle_number"]), h.get("horse_name", ""), h.get("horse_id", ""),
              h.get("jockey", ""), h.get("trainer", ""), h.get("draw", 0),
              h.get("weight", 0), h.get("gear", ""), h.get("training_location", "HK"),
-             last6, odds)
+             last6, odds, h.get("weight_allowance", 0))
         )
     conn.commit()
     conn.close()
@@ -242,6 +248,33 @@ def get_latest_odds(race_id: str) -> dict:
     if row:
         return json.loads(row["win_odds_json"])
     return {}
+
+def get_odds_movement(race_id: str) -> dict:
+    """Return per-horse odds movement: first snapshot vs latest snapshot."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT timestamp, win_odds_json FROM odds_snapshots WHERE race_id = ? ORDER BY timestamp",
+        (race_id,)
+    ).fetchall()
+    conn.close()
+    if len(rows) < 2:
+        return {}
+    first_snap = json.loads(rows[0]["win_odds_json"])
+    latest_snap = json.loads(rows[-1]["win_odds_json"])
+    movement = {}
+    for horse_no, latest_val in latest_snap.items():
+        first_val = first_snap.get(horse_no)
+        if first_val:
+            change = latest_val - first_val
+            pct = change / first_val
+            if pct < -0.12:
+                direction = "STEAMING"
+            elif pct > 0.12:
+                direction = "DRIFTING"
+            else:
+                direction = "STABLE"
+            movement[horse_no] = {"first": first_val, "latest": latest_val, "direction": direction}
+    return movement
 
 # ── Prediction helpers ──
 

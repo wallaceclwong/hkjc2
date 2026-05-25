@@ -10,13 +10,18 @@ import argparse, asyncio, json, re, sys
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from playwright.async_api import async_playwright
 from loguru import logger
 from config import DATA_DIR
-from db import (init_db, get_race_ids_for_date, get_racecard, get_predictions,
-                save_results, save_bet, settle_bet, get_bankroll, update_bankroll)
+from db import (init_db, get_race_ids_for_date, save_results, settle_bet,
+                get_bankroll, update_bankroll, get_db)
+from notify import send_telegram_sync
+
+RESULT_LOG = DATA_DIR / "result_log.parquet"
 
 
 async def scrape_results(date_str: str, venue: str, race_no: int, page) -> dict | None:
@@ -170,10 +175,16 @@ async def scrape_results(date_str: str, venue: str, race_no: int, page) -> dict 
 
 
 def settle(race_id: str, results_data: dict):
-    """Compare predictions with results and settle bets."""
-    preds = get_predictions(race_id)
-    if not preds:
-        logger.info(f"{race_id}: no predictions to settle")
+    """Settle bets that were recorded by predict.py against scraped results."""
+    conn = get_db()
+    unsettled = conn.execute(
+        "SELECT horse_no, stake, odds_taken FROM bets WHERE race_id = ? AND result IS NULL",
+        (race_id,)
+    ).fetchall()
+    conn.close()
+
+    if not unsettled:
+        logger.info(f"{race_id}: no unsettled bets to settle")
         return 0
 
     results = results_data.get("results", [])
@@ -181,46 +192,20 @@ def settle(race_id: str, results_data: dict):
         logger.warning(f"{race_id}: no results to compare")
         return 0
 
-    # Find winner
     winner_no = None
-    win_div = None
     for r in results:
         if r.get("plc") == "1":
             winner_no = r.get("horse_no")
             break
 
-    # Check win dividend
-    for w in results_data.get("dividends", {}).get("WIN", []):
-        if w.get("combination") == winner_no:
-            try:
-                win_div = float(w.get("dividend", 0))
-            except ValueError:
-                pass
-
     total_pnl = 0
     bankroll = get_bankroll()
     balance = bankroll["balance"]
 
-    # Find bets for this race from predictions + audit
-    for p in preds:
-        horse_no = str(p["horse_no"])
-        odds = p.get("win_odds", 0)
-        edge = p.get("pure_ev", 0)
-
-        # Only settle if this was a bet candidate
-        if not (4.0 <= odds <= 15.0 and edge > 1.05 and p.get("rank", 99) <= 4):
-            continue
-
-        # Kelly stake (quarter-Kelly for safety)
-        prob = p.get("pred_prob", 0)
-        kelly = (prob * odds - 1) / (odds - 1) if odds > 1 else 0
-        stake = max(0, kelly * 0.25) * balance * 0.02  # 2% of bankroll max
-        stake = round(min(stake, balance * 0.05), 2)  # Cap at 5%
-
-        if stake <= 0:
-            continue
-
-        save_bet(race_id, horse_no, stake, odds)
+    for row in unsettled:
+        horse_no = str(row["horse_no"])
+        stake = row["stake"]
+        odds = row["odds_taken"]
 
         if horse_no == winner_no:
             pnl = stake * (odds - 1)
@@ -237,8 +222,67 @@ def settle(race_id: str, results_data: dict):
         new_balance = balance + total_pnl
         update_bankroll(new_balance, f"{race_id} settlement", total_pnl)
         logger.info(f"  Bankroll: {balance:.0f} → {new_balance:.0f} ({total_pnl:+.0f})")
+        hwm = bankroll["high_water_mark"]
+        if hwm > 0 and new_balance < hwm * 0.80:
+            drawdown_pct = (1 - new_balance / hwm) * 100
+            send_telegram_sync(
+                f"⚠️ *DRAWDOWN ALERT*\n"
+                f"Balance: {new_balance:.0f} ({drawdown_pct:.1f}% below HWM {hwm:.0f})\n"
+                f"Last race: {race_id} PnL {total_pnl:+.0f}"
+            )
 
     return total_pnl
+
+
+def log_result_rows(race_id: str, results_data: dict):
+    """Append settled race outcomes to result_log.parquet for future retraining."""
+    results = results_data.get("results", [])
+    if not results:
+        return
+
+    conn = get_db()
+    bets_rows = conn.execute(
+        "SELECT horse_no, stake, odds_taken, result, pnl FROM bets WHERE race_id = ?",
+        (race_id,)
+    ).fetchall()
+    conn.close()
+    bets_map = {str(r["horse_no"]): dict(r) for r in bets_rows}
+
+    rows = []
+    for r in results:
+        horse_no = str(r.get("horse_no", ""))
+        try:
+            finish_pos = int(r.get("plc", 99))
+        except (ValueError, TypeError):
+            finish_pos = 99
+        bet = bets_map.get(horse_no, {})
+        rows.append({
+            "race_id": race_id,
+            "horse_no": horse_no,
+            "horse": r.get("horse", ""),
+            "finish_pos": finish_pos,
+            "won": finish_pos == 1,
+            "win_odds": r.get("win_odds", ""),
+            "stake": bet.get("stake"),
+            "odds_taken": bet.get("odds_taken"),
+            "result": bet.get("result"),
+            "pnl": bet.get("pnl"),
+            "logged_at": datetime.now().isoformat(),
+        })
+
+    if not rows:
+        return
+
+    df_new = pd.DataFrame(rows)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if RESULT_LOG.exists():
+        df_existing = pd.read_parquet(RESULT_LOG)
+        df_existing = df_existing[df_existing["race_id"] != race_id]
+        df_out = pd.concat([df_existing, df_new], ignore_index=True)
+    else:
+        df_out = df_new
+    df_out.to_parquet(RESULT_LOG, index=False)
+    logger.info(f"{race_id}: {len(rows)} result rows appended to result_log.parquet")
 
 
 async def main():
@@ -276,9 +320,11 @@ async def main():
                 parts = rid.split("_")
                 race_no = int(parts[-1].replace("R", ""))
                 data = await scrape_results(args.date, args.venue, race_no, page)
-                if data and not args.scrape_only:
-                    pnl = settle(rid, data)
-                    total_pnl += pnl
+                if data:
+                    if not args.scrape_only:
+                        pnl = settle(rid, data)
+                        total_pnl += pnl
+                    log_result_rows(rid, data)
             except Exception as e:
                 logger.error(f"{rid}: {e}")
 
@@ -287,6 +333,8 @@ async def main():
     if not args.scrape_only:
         bankroll = get_bankroll()
         logger.success(f"Learn complete. Total PnL: {total_pnl:+.0f}. Bankroll: {bankroll['balance']:.0f}")
+    else:
+        logger.success("Scrape-only complete — no bets settled")
 
 
 if __name__ == "__main__":

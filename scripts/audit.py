@@ -12,15 +12,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import httpx
 import pandas as pd
 from loguru import logger
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openai import APIError, APITimeoutError
 
-from config import DEEPSEEK_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATA_DIR
-from db import init_db, get_racecard, get_predictions, get_race_ids_for_date, save_audit, get_results, get_latest_odds
+from config import DEEPSEEK_API_KEY, DATA_DIR
+from db import init_db, get_racecard, get_predictions, get_race_ids_for_date, save_audit, get_results, get_latest_odds, get_odds_movement
+from notify import send_telegram_async
 
 PEDIGREE_FILE = DATA_DIR / "pedigree_cache.json"
 
@@ -76,6 +76,7 @@ class WarRoom:
                         target["draw"] = hh.get("draw", 0)
                         target["gear"] = hh.get("gear", "")
                         target["training_location"] = hh.get("training_location", "HK")
+                        target["weight_allowance"] = hh.get("weight_allowance", 0)
                         break
 
         if target is None:
@@ -84,9 +85,27 @@ class WarRoom:
         horse_id = target.get("horse_id", "")
         pedigree = self.pedigree.get(horse_id, {"sire": "Unknown", "dam": "Unknown"})
 
-        # Market context
+        # Market context — current odds snapshot
         latest_odds = get_latest_odds(race_id)
-        market_str = "No live odds data."
+        if latest_odds:
+            sorted_odds = sorted(latest_odds.items(), key=lambda x: float(x[1]))
+            market_str = "Current win odds: " + ", ".join(f"#{k}@{v}" for k, v in sorted_odds[:10])
+        else:
+            market_str = "No live odds data."
+
+        # Odds movement (steam/drift signals)
+        movement = get_odds_movement(race_id)
+        if movement:
+            steam = [(k, v) for k, v in movement.items() if v["direction"] == "STEAMING"]
+            drift = [(k, v) for k, v in movement.items() if v["direction"] == "DRIFTING"]
+            move_parts = []
+            if steam:
+                move_parts.append("STEAMING: " + ", ".join(f"#{k}({v['first']}->{v['latest']})" for k, v in steam))
+            if drift:
+                move_parts.append("DRIFTING: " + ", ".join(f"#{k}({v['first']}->{v['latest']})" for k, v in drift))
+            market_str += "\nMovement — " + (" | ".join(move_parts) if move_parts else "all stable")
+        else:
+            market_str += "\nMovement — insufficient snapshots for analysis"
 
         prompt = f"""
 Act as the 'LUNAR LEAP' STRATEGIC ADVISORY for HKJC.
@@ -97,7 +116,7 @@ Audit the following High-Value Trade using a MULTI-AGENT simulation.
 - ID: {horse_id}
 - Lineage: Sire: {pedigree['sire']} | Dam: {pedigree['dam']}
 - Stats: Odds {target.get('win_odds', 10):.1f} (Fair: {target.get('fair_odds', 10):.1f}), EV: {target.get('pure_ev', 1.0):.2f}
-- Logistics: Draw {target.get('draw', '?')}, Race at {rc.get('venue', '?')}
+- Logistics: Draw {target.get('draw', '?')}, Race at {rc.get('venue', '?')}, Jockey allowance: {target.get('weight_allowance', 0)}lb
 
 ### MARKET MOMENTUM
 {market_str}
@@ -157,34 +176,6 @@ Respond with a JSON block followed by a brief Expert Note.
             return {"verdict": "ERROR", "reasoning": str(e)}
 
 
-async def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not configured — skipping notification")
-        return False
-
-    prefixed = f"[LUNAR LEAP]\n{text}"
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": prefixed[:4000],
-                "parse_mode": "Markdown",
-            }, timeout=10)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
-
-        # Fallback: plain text
-        plain = prefixed.replace("*", "").replace("_", "").replace("`", "")[:4096]
-        try:
-            resp = await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain}, timeout=10)
-            return resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
-            return False
 
 
 async def audit_race(race_id: str, war_room: WarRoom, send_tg: bool = True, force_horse: str = None):
@@ -253,7 +244,7 @@ async def audit_race(race_id: str, war_room: WarRoom, send_tg: bool = True, forc
     )
 
     if send_tg and verdict in ("CONFIRMED", "CAUTION"):
-        await send_telegram(msg)
+        await send_telegram_async(msg)
 
     logger.success(f"{race_id}: verdict={verdict} grade={grade} — {note}")
     return {"race_id": race_id, "verdict": verdict, "grade": grade, "message": msg}

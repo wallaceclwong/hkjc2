@@ -78,53 +78,57 @@ async def main():
         now = datetime.now()
         total = 0
         conn = get_db()
+        try:
+            for i in range(args.months):
+                m = (now.month + i - 1) % 12 + 1
+                y = now.year + (now.month + i - 1) // 12
 
-        for i in range(args.months):
-            m = (now.month + i - 1) % 12 + 1
-            y = now.year + (now.month + i - 1) // 12
+                # Navigate to the target month (HKJC page has month navigation)
+                month_name = datetime(y, m, 1).strftime("%B")
+                logger.info(f"Fetching {month_name} {y}...")
 
-            # Navigate to the target month (HKJC page has month navigation)
-            month_name = datetime(y, m, 1).strftime("%B")
-            logger.info(f"Fetching {month_name} {y}...")
+                # Try clicking the month tab
+                try:
+                    month_links = await page.query_selector_all("a")
+                    for link in month_links:
+                        txt = (await link.inner_text()).strip()
+                        if month_name[:3].upper() in txt.upper() and str(y) in txt:
+                            await link.click()
+                            await page.wait_for_timeout(2000)
+                            break
+                except Exception:
+                    pass
 
-            # Try clicking the month tab
-            try:
-                month_links = await page.query_selector_all("a")
-                for link in month_links:
-                    txt = (await link.inner_text()).strip()
-                    if month_name[:3].upper() in txt.upper() and str(y) in txt:
-                        await link.click()
-                        await page.wait_for_timeout(2000)
-                        break
-            except Exception:
-                pass
+                fixtures = await fetch_month(page, m, y)
+                for f in fixtures:
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO fixtures (date, venue, day_night, race_type, status) VALUES (?,?,?,?,?)",
+                        (f["date"], f["venue"], f["day_night"], f["race_type"], f["status"]),
+                    )
+                    if cur.rowcount:
+                        total += 1
+                        logger.info(f"  {f['date']}  {f['venue']}  {f['day_night']}")
 
-            fixtures = await fetch_month(page, m, y)
-            for f in fixtures:
-                conn.execute(
-                    "INSERT OR IGNORE INTO fixtures (date, venue, day_night, race_type, status) VALUES (?,?,?,?,?)",
-                    (f["date"], f["venue"], f["day_night"], f["race_type"], f["status"]),
-                )
-                total += 1
-                logger.info(f"  {f['date']}  {f['venue']}  {f['day_night']}")
-
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         await browser.close()
 
     logger.success(f"Done: {total} fixtures saved")
 
     # Show upcoming
     conn = get_db()
-    rows = conn.execute(
-        "SELECT date, venue, day_night FROM fixtures WHERE date >= ? ORDER BY date LIMIT 10",
-        (now.strftime("%Y-%m-%d"),)
-    ).fetchall()
-    if rows:
-        logger.info("Upcoming race days:")
-        for r in rows:
-            logger.info(f"  {r['date']}  {r['venue']}  {r['day_night']}")
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT date, venue, day_night FROM fixtures WHERE date >= ? ORDER BY date LIMIT 10",
+            (now.strftime("%Y-%m-%d"),)
+        ).fetchall()
+        if rows:
+            logger.info("Upcoming race days:")
+            for r in rows:
+                logger.info(f"  {r['date']}  {r['venue']}  {r['day_night']}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

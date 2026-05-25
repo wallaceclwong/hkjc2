@@ -1,0 +1,10 @@
+[Unit]
+Description=HKJC2 — refresh ML predictions with latest live odds
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hkjc2
+Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/hkjc2/.venv/bin/python scripts/predict.py --date $(date +%%Y-%%m-%%d) --venue ST
