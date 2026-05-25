@@ -1,0 +1,9 @@
+[Unit]
+Description=HKJC2 nightly results scrape and settlement (Sat/Sun 23:00 HKT)
+
+[Timer]
+OnCalendar=Sat,Sun *-*-* 15:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

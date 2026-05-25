@@ -1,0 +1,13 @@
+catboost>=1.2
+httpx>=0.28
+lightgbm>=4.6
+loguru>=0.7
+numpy>=2.0
+openai>=2.30
+pandas>=3.0
+playwright>=1.58
+pydantic>=2.12
+python-dotenv>=1.2
+scikit-learn>=1.8
+tenacity>=9.1
+xgboost>=3.2

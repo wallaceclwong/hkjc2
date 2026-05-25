@@ -1,0 +1,9 @@
+[Unit]
+Description=HKJC2 live odds polling (every 3 min during HK racing hours)
+
+[Timer]
+OnCalendar=*-*-* 04:00..10:45/3:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

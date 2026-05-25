@@ -1,0 +1,9 @@
+[Unit]
+Description=HKJC2 — scrape live odds (called by timer)
+
+[Service]
+Type=oneshot
+User=cp
+WorkingDirectory=/opt/hkjc2
+Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_odds.py --date $(date +%%Y-%%m-%%d) --venue ST --audit
