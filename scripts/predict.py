@@ -22,13 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import MODEL_DIR, DATA_DIR, ALL_FEATURES, RACE_TIME_BY_DIST, RACE_TIME_DEFAULT
 from db import init_db, get_racecard, get_horses, get_latest_odds, save_predictions, get_race_ids_for_date, get_db
 
-# Fallback: look in sibling ultimate_engine project for models + training data
-UE_DIR = Path(__file__).resolve().parent.parent.parent / "ultimate_engine"
-if not MODEL_DIR.exists():
-    MODEL_DIR_ALT = UE_DIR / "models"
-    if MODEL_DIR_ALT.exists():
-        MODEL_DIR = MODEL_DIR_ALT
-
 LGB_PATH    = MODEL_DIR / "model_lgb.txt"
 XGB_PATH    = MODEL_DIR / "model_xgb.json"
 CAT_PATH    = MODEL_DIR / "model_cat.cbm"
@@ -36,9 +29,7 @@ ENCODER_PATH = MODEL_DIR / "xgb_encoder.pkl"
 META_PATH   = MODEL_DIR / "model_meta.json"
 
 MATRIX_PATH = Path(__file__).resolve().parent.parent / "training_data" / "final_feature_matrix.parquet"
-if not MATRIX_PATH.exists():
-    MATRIX_PATH = UE_DIR / "final_feature_matrix.parquet"
-AI_CACHE = UE_DIR / "data" / "ai_sentiment_cache.parquet"
+AI_CACHE = DATA_DIR / "ai_sentiment_cache.parquet"
 
 TEMPERATURE = 0.55
 MARKET_BLEND = 0.30
@@ -223,7 +214,7 @@ def main():
 
     if not MATRIX_PATH.exists():
         logger.error(f"Feature matrix not found at {MATRIX_PATH}")
-        logger.error("Copy final_feature_matrix.parquet from ultimate_engine or run training first.")
+        logger.error("Run training first to generate final_feature_matrix.parquet.")
         return
 
     logger.info("Loading models...")
