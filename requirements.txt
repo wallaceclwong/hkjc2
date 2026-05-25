@@ -6,6 +6,7 @@ numpy>=2.0
 openai>=2.30
 pandas>=3.0
 playwright>=1.58
+pyarrow>=23.0
 pydantic>=2.12
 python-dotenv>=1.2
 scikit-learn>=1.8
