@@ -7,5 +7,5 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/hkjc2
 Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_racecards.py --date $(date +%%Y-%%m-%%d) --venue ST
-ExecStartPost=/opt/hkjc2/.venv/bin/python scripts/predict.py --date $(date +%%Y-%%m-%%d) --venue ST
+ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_racecards.py --date $(date +%%Y-%%m-%%d)
+ExecStartPost=/opt/hkjc2/.venv/bin/python scripts/predict.py --date $(date +%%Y-%%m-%%d)

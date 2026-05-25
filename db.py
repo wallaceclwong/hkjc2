@@ -409,3 +409,13 @@ def is_race_day(date: str = None) -> bool:
     row = conn.execute("SELECT 1 FROM fixtures WHERE date = ?", (date,)).fetchone()
     conn.close()
     return row is not None
+
+def get_venue_for_date(date_str: str) -> str | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT venue FROM fixtures WHERE date = ? AND status = 'Scheduled' LIMIT 1",
+        (date_str,)
+    ).fetchone()
+    conn.close()
+    return row["venue"] if row else None
+

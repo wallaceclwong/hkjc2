@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from playwright.async_api import async_playwright
 from loguru import logger
 from config import DATA_DIR
-from db import save_racecard, init_db
+from db import save_racecard, init_db, get_venue_for_date
 
 GEAR_CODES = {
     "B": "Blinkers", "BO": "Blinkers Off", "CO": "Cap Off", "CP": "Cheek Pieces",
@@ -257,11 +257,15 @@ async def scrape_one(race_no: int, date_str: str, venue: str, page):
 async def main():
     parser = argparse.ArgumentParser(description="Scrape HKJC racecards")
     parser.add_argument("--date", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--venue", default="ST", help="ST or HV")
+    parser.add_argument("--venue", default=None, help="ST or HV (auto-resolved from DB if omitted)")
     parser.add_argument("--races", default="1-11", help="e.g. '1-11' or '1,2,3'")
     args = parser.parse_args()
 
     init_db()
+
+    if not args.venue:
+        args.venue = get_venue_for_date(args.date) or "ST"
+        logger.info(f"Auto-resolved venue for {args.date} to: {args.venue}")
 
     # Parse race list
     races = []

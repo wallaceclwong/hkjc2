@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from playwright.async_api import async_playwright
 from loguru import logger
 from config import DATA_DIR
-from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day
+from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day, get_venue_for_date
 
 HKJC_BET_URL = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
 
@@ -118,12 +118,16 @@ async def scrape_one(date_str: str, venue: str, race_no: int, page) -> dict | No
 async def main():
     parser = argparse.ArgumentParser(description="Scrape HKJC live odds")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    parser.add_argument("--venue", default="ST")
+    parser.add_argument("--venue", default=None, help="ST or HV (auto-resolved from DB if omitted)")
     parser.add_argument("--race", type=int, default=0, help="Single race #, or 0 for all")
     parser.add_argument("--audit", action="store_true", help="Trigger audit.py when T-15 detected")
     args = parser.parse_args()
 
     init_db()
+
+    if not args.venue:
+        args.venue = get_venue_for_date(args.date) or "ST"
+        logger.info(f"Auto-resolved venue for {args.date} to: {args.venue}")
 
     # Early exit: don't launch browser on non-race days or outside HK racing hours
     if not is_race_day(args.date):

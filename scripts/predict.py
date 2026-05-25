@@ -20,7 +20,7 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import MODEL_DIR, DATA_DIR, ALL_FEATURES, RACE_TIME_BY_DIST, RACE_TIME_DEFAULT
-from db import init_db, get_racecard, get_latest_odds, save_predictions, get_race_ids_for_date, get_db, save_bet, get_bankroll
+from db import init_db, get_racecard, get_latest_odds, save_predictions, get_race_ids_for_date, get_db, save_bet, get_bankroll, get_venue_for_date
 
 LGB_PATH  = MODEL_DIR / "model_lgb.txt"
 XGB_PATH  = MODEL_DIR / "model_xgb.json"
@@ -279,11 +279,15 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, features,
 def main():
     parser = argparse.ArgumentParser(description="Generate ML predictions")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    parser.add_argument("--venue", default="ST")
+    parser.add_argument("--venue", default=None, help="ST or HV (auto-resolved from DB if omitted)")
     parser.add_argument("--race", type=int, default=0, help="Single race #, or 0 for all")
     args = parser.parse_args()
 
     init_db()
+
+    if not args.venue:
+        args.venue = get_venue_for_date(args.date) or "ST"
+        logger.info(f"Auto-resolved venue for {args.date} to: {args.venue}")
 
     if not MATRIX_PATH.exists():
         logger.error(f"Feature matrix not found at {MATRIX_PATH}")

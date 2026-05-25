@@ -18,7 +18,7 @@ from playwright.async_api import async_playwright
 from loguru import logger
 from config import DATA_DIR
 from db import (init_db, get_race_ids_for_date, save_results, settle_bet,
-                get_bankroll, update_bankroll, get_db)
+                get_bankroll, update_bankroll, get_db, get_venue_for_date)
 from notify import send_telegram_sync
 
 RESULT_LOG = DATA_DIR / "result_log.parquet"
@@ -288,12 +288,16 @@ def log_result_rows(race_id: str, results_data: dict):
 async def main():
     parser = argparse.ArgumentParser(description="Scrape results and settle bets")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    parser.add_argument("--venue", default="ST")
+    parser.add_argument("--venue", default=None, help="ST or HV (auto-resolved from DB if omitted)")
     parser.add_argument("--race", type=int, default=0)
     parser.add_argument("--scrape-only", action="store_true", help="Scrape results without settling")
     args = parser.parse_args()
 
     init_db()
+
+    if not args.venue:
+        args.venue = get_venue_for_date(args.date) or "ST"
+        logger.info(f"Auto-resolved venue for {args.date} to: {args.venue}")
 
     if args.race > 0:
         race_ids = [f"{args.date}_{args.venue}_R{args.race}"]
