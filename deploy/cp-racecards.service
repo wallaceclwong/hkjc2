@@ -1,10 +1,11 @@
 [Unit]
-Description=HKJC2 — scrape racecards for today
+Description=HKJC2 — scrape racecards + generate predictions
 After=network.target
 
 [Service]
 Type=oneshot
-User=cp
+User=root
 WorkingDirectory=/opt/hkjc2
 Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_racecards.py --date $(date +%%Y-%%m-%%d) --venue ST
+ExecStartPost=/opt/hkjc2/.venv/bin/python scripts/predict.py --date $(date +%%Y-%%m-%%d) --venue ST

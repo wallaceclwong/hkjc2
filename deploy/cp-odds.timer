@@ -1,8 +1,8 @@
 [Unit]
-Description=HKJC2 live odds polling (every 3 min during HK racing hours)
+Description=HKJC2 live odds polling (every 3 min during HK racing hours: 12:00-23:00 HKT)
 
 [Timer]
-OnCalendar=*-*-* 04:00..10:45/3:00 UTC
+OnCalendar=*-*-* 04:00..14:45/3:00 UTC
 Persistent=true
 
 [Install]

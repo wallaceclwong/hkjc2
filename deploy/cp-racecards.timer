@@ -1,8 +1,8 @@
 [Unit]
-Description=HKJC2 racecard scrape (Sat/Sun 11:00 HKT)
+Description=HKJC2 racecard scrape + predict (Wed/Sat/Sun 10:00 HKT)
 
 [Timer]
-OnCalendar=Sat,Sun *-*-* 03:00:00 UTC
+OnCalendar=Wed,Sat,Sun *-*-* 02:00:00 UTC
 Persistent=true
 
 [Install]
