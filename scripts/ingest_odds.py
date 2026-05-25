@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from playwright.async_api import async_playwright
 from loguru import logger
 from config import DATA_DIR
-from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard
+from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day
 
 HKJC_BET_URL = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
 
@@ -124,6 +124,16 @@ async def main():
     args = parser.parse_args()
 
     init_db()
+
+    # Early exit: don't launch browser on non-race days or outside HK racing hours
+    if not is_race_day(args.date):
+        logger.info(f"{args.date}: not a race day — skipping odds scrape")
+        return
+
+    now_utc = datetime.utcnow().hour
+    if not (3 <= now_utc <= 15):
+        logger.info(f"UTC {now_utc:02d}:00 — outside HK racing window (03:00-15:00 UTC), skipping")
+        return
 
     if args.race > 0:
         races_to_scrape = [{"race_no": args.race, "jump_time": "13:00"}]
