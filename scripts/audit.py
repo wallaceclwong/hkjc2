@@ -187,7 +187,7 @@ async def send_telegram(text: str):
             return False
 
 
-async def audit_race(race_id: str, war_room: WarRoom, send_tg: bool = True):
+async def audit_race(race_id: str, war_room: WarRoom, send_tg: bool = True, force_horse: str = None):
     preds = get_predictions(race_id)
     if not preds:
         logger.warning(f"{race_id}: no predictions found")
@@ -204,6 +204,12 @@ async def audit_race(race_id: str, war_room: WarRoom, send_tg: bool = True):
                   if 4.0 <= p.get("win_odds", 0) <= 15.0
                   and p.get("pure_ev", 0) > 1.05
                   and p.get("rank", 99) <= 4]
+
+    if force_horse:
+        candidates = [p for p in preds if str(p.get("horse_no")) == str(force_horse)]
+        if not candidates:
+            logger.error(f"{race_id}: forced horse #{force_horse} not found in predictions")
+            return None
 
     if not candidates or wet:
         logger.info(f"{race_id}: no audit candidates{' (wet track)' if wet else ''}")
@@ -259,6 +265,7 @@ async def main():
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
     parser.add_argument("--venue", default="ST")
     parser.add_argument("--no-telegram", action="store_true")
+    parser.add_argument("--horse", help="Force audit a specific horse number (bypasses filters)")
     args = parser.parse_args()
 
     init_db()
@@ -270,12 +277,12 @@ async def main():
     war_room = WarRoom()
 
     if args.race_id:
-        await audit_race(args.race_id, war_room, send_tg=not args.no_telegram)
+        await audit_race(args.race_id, war_room, send_tg=not args.no_telegram, force_horse=args.horse)
     else:
         race_ids = get_race_ids_for_date(args.date, args.venue)
         for rid in race_ids:
             try:
-                await audit_race(rid, war_room, send_tg=not args.no_telegram)
+                await audit_race(rid, war_room, send_tg=not args.no_telegram, force_horse=args.horse)
             except Exception as e:
                 logger.error(f"{rid}: audit failed — {e}")
 
