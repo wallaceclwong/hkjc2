@@ -8,3 +8,4 @@ User=root
 WorkingDirectory=/opt/hkjc2
 Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/opt/hkjc2/.venv/bin/python scripts/learn.py --date $(date +%%Y-%%m-%%d)
+OnFailure=cp-failure-notify@%n.service

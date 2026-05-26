@@ -52,6 +52,7 @@ cp deploy/cp-odds.service /etc/systemd/system/
 cp deploy/cp-odds.timer /etc/systemd/system/
 cp deploy/cp-learn.service /etc/systemd/system/
 cp deploy/cp-learn.timer /etc/systemd/system/
+cp deploy/cp-failure-notify@.service /etc/systemd/system/
 
 systemctl daemon-reload
 systemctl enable cp-racecards.timer

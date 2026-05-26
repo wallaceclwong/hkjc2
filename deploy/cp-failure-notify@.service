@@ -1,0 +1,9 @@
+[Unit]
+Description=HKJC2 failure notification for %i
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hkjc2
+Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/opt/hkjc2/.venv/bin/python scripts/job_failure_alert.py %i

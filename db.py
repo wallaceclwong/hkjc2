@@ -1,6 +1,6 @@
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from config import DB_PATH, DATA_DIR
 
@@ -275,6 +275,121 @@ def get_odds_movement(race_id: str) -> dict:
                 direction = "STABLE"
             movement[horse_no] = {"first": first_val, "latest": latest_val, "direction": direction}
     return movement
+
+def get_market_microstructure(race_id: str) -> dict:
+    """Calculate Implied Bookmaker Margin Overround and Odds Velocity for each horse."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT timestamp, win_odds_json FROM odds_snapshots WHERE race_id = ? ORDER BY timestamp",
+        (race_id,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return {
+            "overround": 0.0,
+            "velocity": {},
+            "steamers": [],
+            "drifters": [],
+            "fastest_steamer": None,
+            "fastest_drifter": None,
+            "snapshots_count": 0,
+            "dt_minutes": 0.0
+        }
+
+    # Latest snapshot
+    latest_snap = json.loads(rows[-1]["win_odds_json"])
+    latest_time = datetime.fromisoformat(rows[-1]["timestamp"])
+
+    # Calculate Current Overround (sum of 1 / win_odds - 1.0)
+    overround_sum = 0.0
+    for h_no, odds in latest_snap.items():
+        if odds > 0:
+            overround_sum += 1.0 / odds
+    overround_margin = overround_sum - 1.0
+
+    # Calculate Odds Velocity
+    # We want to find a snapshot close to 10 minutes ago
+    prev_row = None
+    if len(rows) >= 2:
+        best_diff = float("inf")
+        for r in rows[:-1]:  # exclude latest
+            t = datetime.fromisoformat(r["timestamp"])
+            diff = abs((latest_time - t).total_seconds() - 600)  # 600s = 10 minutes
+            if diff < best_diff:
+                best_diff = diff
+                prev_row = r
+
+    # Fallback to the first snapshot if no 10-minute snapshot is ideal or we only have 2 snapshots
+    if not prev_row and len(rows) >= 2:
+        prev_row = rows[0]
+
+    velocity = {}
+    steamer_list = []
+    drifter_list = []
+    fastest_steamer = None
+    fastest_drifter = None
+    max_steam_rate = 0.0  # Most negative velocity
+    max_drift_rate = 0.0  # Most positive velocity
+
+    if prev_row:
+        prev_snap = json.loads(prev_row["win_odds_json"])
+        prev_time = datetime.fromisoformat(prev_row["timestamp"])
+        dt_min = (latest_time - prev_time).total_seconds() / 60.0
+        if dt_min < 0.1:
+            dt_min = 0.1
+
+        for h_no, latest_val in latest_snap.items():
+            first_val = prev_snap.get(h_no)
+            if first_val and first_val > 0:
+                change = latest_val - first_val
+                pct_change = change / first_val
+                # velocity: % change in odds per minute
+                vel = pct_change / dt_min
+                velocity[h_no] = {
+                    "velocity": vel,
+                    "pct_change_10m": pct_change,
+                    "first": first_val,
+                    "latest": latest_val
+                }
+
+                # Track fastest steam / drift
+                if vel < max_steam_rate:
+                    max_steam_rate = vel
+                    fastest_steamer = {
+                        "horse_no": h_no,
+                        "velocity": vel,
+                        "pct_change": pct_change,
+                        "first": first_val,
+                        "latest": latest_val
+                    }
+                if vel > max_drift_rate:
+                    max_drift_rate = vel
+                    fastest_drifter = {
+                        "horse_no": h_no,
+                        "velocity": vel,
+                        "pct_change": pct_change,
+                        "first": first_val,
+                        "latest": latest_val
+                    }
+
+                # General steamers and drifters in last 10m
+                if pct_change < -0.10:
+                    steamer_list.append(h_no)
+                elif pct_change > 0.10:
+                    drifter_list.append(h_no)
+
+    return {
+        "overround": overround_margin,
+        "velocity": velocity,
+        "steamers": steamer_list,
+        "drifters": drifter_list,
+        "fastest_steamer": fastest_steamer,
+        "fastest_drifter": fastest_drifter,
+        "snapshots_count": len(rows),
+        "dt_minutes": (latest_time - datetime.fromisoformat(rows[0]["timestamp"])).total_seconds() / 60.0 if len(rows) >= 2 else 0.0
+    }
+
 
 # ── Prediction helpers ──
 

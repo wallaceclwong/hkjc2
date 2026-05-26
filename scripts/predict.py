@@ -49,7 +49,15 @@ def _load_models():
                 logger.warning(f"Models are {days_old} days old (trained {trained_at}) — consider retraining")
         except Exception:
             pass
-    return lgb_model, xgb_model, cat_model, meta["features"]
+
+    params = {
+        "temperature": meta.get("temperature", 0.55),
+        "market_blend": meta.get("market_blend", 0.30),
+        "lgb_weight": meta.get("lgb_weight", 0.33),
+        "xgb_weight": meta.get("xgb_weight", 0.33),
+        "cat_weight": meta.get("cat_weight", 0.34)
+    }
+    return lgb_model, xgb_model, cat_model, meta["features"], params
 
 
 def _load_wet_dry_stats(df: pd.DataFrame) -> dict:
@@ -108,7 +116,8 @@ def _normalize(s):
 
 
 def predict_race(race_id: str, lgb_model, xgb_model, cat_model, features,
-                 j_stats, t_stats, h_stats, ai_scores, wet_dry_stats: dict) -> dict | None:
+                 j_stats, t_stats, h_stats, ai_scores, wet_dry_stats: dict,
+                 params: dict = None) -> dict | None:
     rc = get_racecard(race_id)
     if not rc:
         logger.warning(f"{race_id}: racecard not found in DB")
@@ -205,15 +214,31 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, features,
     xgb_scores = xgb_model.predict(xgb.DMatrix(X, enable_categorical=True))
     cat_scores = cat_model.predict(X)
 
-    df["ensemble_score"] = (_normalize(lgb_scores) + _normalize(xgb_scores) + _normalize(cat_scores)) / 3.0
+    if params is None:
+        params = {}
+    temp = params.get("temperature", TEMPERATURE)
+    blend = params.get("market_blend", MARKET_BLEND)
+    w_lgb = params.get("lgb_weight", 0.33)
+    w_xgb = params.get("xgb_weight", 0.33)
+    w_cat = params.get("cat_weight", 0.34)
+
+    w_sum = w_lgb + w_xgb + w_cat
+    if w_sum > 0:
+        w_lgb /= w_sum
+        w_xgb /= w_sum
+        w_cat /= w_sum
+    else:
+        w_lgb, w_xgb, w_cat = 0.33, 0.33, 0.34
+
+    df["ensemble_score"] = (w_lgb * _normalize(lgb_scores) + w_xgb * _normalize(xgb_scores) + w_cat * _normalize(cat_scores))
     df["rank"] = df["ensemble_score"].rank(ascending=False, method="first").astype(int)
 
     scores = df["ensemble_score"].values
-    exp_scores = np.exp((scores - np.max(scores)) / TEMPERATURE)
+    exp_scores = np.exp((scores - np.max(scores)) / temp)
     model_probs = exp_scores / exp_scores.sum()
 
     market_probs = df["implied_prob_norm"].values
-    blended = (1 - MARKET_BLEND) * model_probs + MARKET_BLEND * market_probs
+    blended = (1 - blend) * model_probs + blend * market_probs
     blended = blended / blended.sum()
 
     df["model_prob_pure"] = model_probs
@@ -295,7 +320,7 @@ def main():
         return
 
     logger.info("Loading models...")
-    lgb_model, xgb_model, cat_model, features = _load_models()
+    lgb_model, xgb_model, cat_model, features, params = _load_models()
     logger.info("Loading historical stats...")
     df_full = pd.read_parquet(MATRIX_PATH)
     j_stats, t_stats, h_stats, wet_dry_stats = _load_historical_stats()
@@ -314,7 +339,7 @@ def main():
     for rid in race_ids:
         try:
             r = predict_race(rid, lgb_model, xgb_model, cat_model, features,
-                             j_stats, t_stats, h_stats, ai_scores, wet_dry_stats)
+                             j_stats, t_stats, h_stats, ai_scores, wet_dry_stats, params)
             if r:
                 results.append(r)
                 tp = r["top_pick"]

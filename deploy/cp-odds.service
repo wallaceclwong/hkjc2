@@ -7,3 +7,4 @@ User=root
 WorkingDirectory=/opt/hkjc2
 Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_odds.py --date $(date +%%Y-%%m-%%d) --audit
+OnFailure=cp-failure-notify@%n.service

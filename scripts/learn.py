@@ -6,7 +6,7 @@ Usage:
     python scripts/learn.py --date 2026-05-25 --venue HV --race 3
 """
 
-import argparse, asyncio, json, re, sys
+import argparse, asyncio, json, re, subprocess, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -337,6 +337,15 @@ async def main():
     if not args.scrape_only:
         bankroll = get_bankroll()
         logger.success(f"Learn complete. Total PnL: {total_pnl:+.0f}. Bankroll: {bankroll['balance']:.0f}")
+        
+        # Continuous self-correction trigger: Automatically recalibrate ensemble weights
+        try:
+            logger.info("Triggering automatic model weight and hyperparameter recalibration...")
+            recal_script = str(Path(__file__).resolve().parent / "recalibrate.py")
+            subprocess.run([sys.executable, recal_script], check=True)
+            logger.success("Model recalibration completed successfully!")
+        except Exception as e:
+            logger.error(f"Automatic model recalibration failed: {e}")
     else:
         logger.success("Scrape-only complete — no bets settled")
 

@@ -19,7 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from openai import APIError, APITimeoutError
 
 from config import DEEPSEEK_API_KEY, DATA_DIR
-from db import init_db, get_racecard, get_predictions, get_race_ids_for_date, save_audit, get_results, get_latest_odds, get_odds_movement
+from db import init_db, get_racecard, get_predictions, get_race_ids_for_date, save_audit, get_results, get_latest_odds, get_odds_movement, get_market_microstructure
 from notify import send_telegram_async
 
 PEDIGREE_FILE = DATA_DIR / "pedigree_cache.json"
@@ -93,19 +93,34 @@ class WarRoom:
         else:
             market_str = "No live odds data."
 
-        # Odds movement (steam/drift signals)
-        movement = get_odds_movement(race_id)
-        if movement:
-            steam = [(k, v) for k, v in movement.items() if v["direction"] == "STEAMING"]
-            drift = [(k, v) for k, v in movement.items() if v["direction"] == "DRIFTING"]
-            move_parts = []
-            if steam:
-                move_parts.append("STEAMING: " + ", ".join(f"#{k}({v['first']}->{v['latest']})" for k, v in steam))
-            if drift:
-                move_parts.append("DRIFTING: " + ", ".join(f"#{k}({v['first']}->{v['latest']})" for k, v in drift))
-            market_str += "\nMovement — " + (" | ".join(move_parts) if move_parts else "all stable")
+        # Advanced Market Microstructure Metrics (Overround & Odds Velocity)
+        micro = get_market_microstructure(race_id)
+        if micro and micro.get("snapshots_count", 0) >= 1:
+            overround_pct = micro["overround"] * 100
+            market_str += f"\nImplied Bookmaker Margin Overround: {overround_pct:.1f}%"
+            
+            if micro.get("snapshots_count", 0) >= 2:
+                market_str += f" (Calculated over {micro['snapshots_count']} snapshots spanning {micro['dt_minutes']:.1f} minutes)"
+                
+                # Highlight fastest steamer and drifter
+                fs = micro.get("fastest_steamer")
+                fd = micro.get("fastest_drifter")
+                if fs:
+                    market_str += f"\n- FASTEST STEAMER (Gaining Support): #{fs['horse_no']} ({fs['first']} -> {fs['latest']} | change: {fs['pct_change']*100:+.1f}% | velocity: {fs['velocity']*100:+.2f}%/min)"
+                if fd:
+                    market_str += f"\n- FASTEST DRIFTER (Losing Support): #{fd['horse_no']} ({fd['first']} -> {fd['latest']} | change: {fd['pct_change']*100:+.1f}% | velocity: {fd['velocity']*100:+.2f}%/min)"
+                
+                # List general steamers and drifters
+                steamers = micro.get("steamers", [])
+                drifters = micro.get("drifters", [])
+                if steamers:
+                    market_str += f"\n- Other Steamers (< -10% drop): " + ", ".join(f"#{h}" for h in steamers)
+                if drifters:
+                    market_str += f"\n- Other Drifters (> +10% rise): " + ", ".join(f"#{h}" for h in drifters)
+            else:
+                market_str += "\n- Movement: Insufficient snapshots for velocity and steam/drift rate analysis."
         else:
-            market_str += "\nMovement — insufficient snapshots for analysis"
+            market_str += "\n- Movement: No odds snapshots available."
 
         prompt = f"""
 Act as the 'LUNAR LEAP' STRATEGIC ADVISORY for HKJC.
