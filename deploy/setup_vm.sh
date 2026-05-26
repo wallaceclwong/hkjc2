@@ -53,11 +53,14 @@ cp deploy/cp-odds.timer /etc/systemd/system/
 cp deploy/cp-learn.service /etc/systemd/system/
 cp deploy/cp-learn.timer /etc/systemd/system/
 cp deploy/cp-failure-notify@.service /etc/systemd/system/
+cp deploy/cp-fixtures.service /etc/systemd/system/
+cp deploy/cp-fixtures.timer /etc/systemd/system/
 
 systemctl daemon-reload
 systemctl enable cp-racecards.timer
 systemctl enable cp-odds.timer
 systemctl enable cp-learn.timer
+systemctl enable cp-fixtures.timer
 
 echo ""
 echo "=== Setup complete ==="

@@ -169,10 +169,11 @@ async def main():
                     if mins is not None and 10 <= mins <= 20:
                         logger.info(f"R{r['race_no']}: T-{mins}min — triggering audit...")
                         script = str(Path(__file__).parent / "audit.py")
-                        subprocess.Popen(
+                        proc = subprocess.Popen(
                             [sys.executable, script, "--race-id", result["race_id"]],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
                         )
+                        logger.info(f"Audit PID {proc.pid} spawned for {result['race_id']}")
             except Exception as e:
                 logger.error(f"R{r['race_no']}: {e}")
 

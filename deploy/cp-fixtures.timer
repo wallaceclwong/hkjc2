@@ -1,0 +1,10 @@
+[Unit]
+Description=HKJC2 monthly fixture refresh (1st of month 04:00 UTC)
+Wants=cp-fixtures.service
+
+[Timer]
+OnCalendar=*-*-01 04:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
