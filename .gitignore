@@ -7,3 +7,5 @@ models/
 training_data/
 .DS_Store
 Thumbs.db
+backtest/cache/
+.claude/
