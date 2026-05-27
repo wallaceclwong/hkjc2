@@ -1,11 +1,11 @@
 [Unit]
 Description=HKJC2 — scrape season fixture schedule
 After=network.target
+OnFailure=cp-failure-notify@%n.service
 
 [Service]
 Type=oneshot
 User=root
 WorkingDirectory=/opt/hkjc2
-Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment=PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/hkjc2/.venv/bin/python scripts/ingest_fixtures.py --months 3
-OnFailure=cp-failure-notify@%n.service

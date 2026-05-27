@@ -1,11 +1,11 @@
 [Unit]
 Description=HKJC2 — refresh ML predictions with latest live odds
 After=network.target
+OnFailure=cp-failure-notify@%n.service
 
 [Service]
 Type=oneshot
 User=root
 WorkingDirectory=/opt/hkjc2
-Environment="PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/opt/hkjc2/.venv/bin/python scripts/predict.py --date $(date +%%Y-%%m-%%d)
-OnFailure=cp-failure-notify@%n.service
+Environment=PATH=/opt/hkjc2/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c '/opt/hkjc2/.venv/bin/python scripts/predict.py --date $$(date +%%Y-%%m-%%d)'

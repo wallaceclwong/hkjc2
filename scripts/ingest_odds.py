@@ -44,15 +44,23 @@ def _minutes_to_jump(jump_time_str: str) -> int | None:
     return None
 
 
-async def scrape_one(date_str: str, venue: str, race_no: int, page) -> dict | None:
+async def scrape_one(date_str: str, venue: str, race_no: int, page, retry_on_redirect: bool = True) -> dict | None:
     date_path = date_str.replace("-", "/")
     url = HKJC_BET_URL.format(date_path=date_path, venue=venue, race_no=race_no)
     race_id = f"{date_str}_{venue}_R{race_no}"
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     except Exception:
         logger.warning(f"R{race_no}: page load timeout, trying to parse anyway")
+        resp = None
+
+    # Detect redirect away from odds page (e.g. to /en/home when not logged in)
+    current_url = page.url
+    if "/wp/" not in current_url:
+        logger.warning(f"R{race_no}: redirected to {current_url} — session may need login. "
+                        "Visit bet.hkjc.com manually in a headed browser on this machine to establish a session.")
+        return None
 
     # Wait for odds elements
     selectors = [f"#wpleg_WIN_{race_no}_1", f".winOdds_{race_no}", "table.win-odds", '[data-type="win-odds"]', "table"]
@@ -66,7 +74,7 @@ async def scrape_one(date_str: str, venue: str, race_no: int, page) -> dict | No
             continue
 
     if not found:
-        logger.warning(f"R{race_no}: no odds table found")
+        logger.warning(f"R{race_no}: no odds table found on page (URL: {current_url})")
         return None
 
     win_odds = {}
@@ -134,7 +142,7 @@ async def main():
         logger.info(f"{args.date}: not a race day — skipping odds scrape")
         return
 
-    now_utc = datetime.utcnow().hour
+    now_utc = datetime.now(datetime.UTC).hour
     if not (3 <= now_utc <= 15):
         logger.info(f"UTC {now_utc:02d}:00 — outside HK racing window (03:00-15:00 UTC), skipping")
         return
@@ -160,6 +168,13 @@ async def main():
         await page.set_extra_http_headers({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
         })
+
+        # Pre-warm: visit home page first to establish session cookies
+        try:
+            await page.goto("https://bet.hkjc.com/en/racing", wait_until="domcontentloaded", timeout=30000)
+            logger.debug("Pre-warmed session on bet.hkjc.com")
+        except Exception:
+            logger.debug("Pre-warm failed (non-fatal)")
 
         for r in races_to_scrape:
             try:
