@@ -1,11 +1,12 @@
-"""Backtest engine — simulates Google Weather edge strategy against Polymarket.
+"""Backtest engine — weather forecast edge against real Polymarket CLOB prices.
 
 Simulates: for each market in the enriched Polymarket dataset:
   1. Parse temperature threshold from market title
   2. Look up actual weather for that city+date (ground truth)
   3. Compute our model's probability for the bracket
-  4. If our_prob differs from baseline, record a paper bet
-  5. Score against the actual resolution from Polymarket
+  4. Compare against real CLOB trade prices (market_prob)
+  5. Flat 2% of bankroll per bet, $500 max
+  6. Score against the actual resolution from Polymarket
 """
 import re
 from datetime import datetime
@@ -16,10 +17,10 @@ import pandas as pd
 from loguru import logger
 
 from backtest.config import (
-    CITIES, MIN_EDGE, MIN_CONFIDENCE, KELLY_FRACTION, MAX_STAKE, INITIAL_BANK, CACHE_DIR,
+    CITIES, MIN_EDGE, MIN_CONFIDENCE, MAX_STAKE, INITIAL_BANK, CACHE_DIR,
 )
 from backtest.fetch_weather import fetch_all_weather, weather_to_forecast_dict
-from backtest.fetch_polymarket import get_settled_market_outcomes, ENRICHED_FILE
+from backtest.fetch_polymarket import get_settled_market_outcomes
 
 RESULTS_FILE = Path(CACHE_DIR) / "backtest_results.parquet"
 
@@ -147,18 +148,45 @@ def calculate_confidence(forecast: dict) -> float:
     return min(0.95, max(0.55, base_conf))
 
 
-def compute_bracket_probability(forecast: dict, bracket: dict) -> float:
-    """Probability that the actual temperature falls within the market's bracket.
+def build_climatology(weather_df: pd.DataFrame) -> dict:
+    """Build per-city, per-month temperature climatology from historical data.
 
-    Uses the forecast max/min with a calibrated uncertainty model.
-    Based on historical weather forecast error: 1-day temp forecasts have
-    a typical RMSE of ~1.5-2°C for max temperature, ~2-3°C for min temperature.
+    Returns: {city: {month: {"max_mean": °C, "max_std": °C, "min_mean": °C, "min_std": °C}}}
+    """
+    climo = {}
+    for city in weather_df["city"].unique():
+        cd = weather_df[weather_df["city"] == city].copy()
+        cd["month"] = cd["date"].dt.month
+        climo[city] = {}
+        for month in range(1, 13):
+            md = cd[cd["month"] == month]
+            if len(md) >= 5:  # minimum data threshold
+                climo[city][month] = {
+                    "max_mean": float(md["temperature_2m_max"].mean()),
+                    "max_std": float(md["temperature_2m_max"].std()),
+                    "min_mean": float(md["temperature_2m_min"].mean()),
+                    "min_std": float(md["temperature_2m_min"].std()),
+                }
+            elif climo[city]:
+                # Fall back to nearest month
+                climo[city][month] = climo[city][max(climo[city].keys())]
+    return climo
+
+
+def compute_bracket_probability(forecast: dict, bracket: dict, climo: dict) -> float:
+    """Probability of bracket using observed max/min as forecast with seasonal climatological uncertainty.
+
+    Uses the observed max/min as the mean (represents a perfect forecast),
+    and the seasonal standard deviation as the uncertainty (captures day-to-day
+    variability around the climatological norm).
     """
     from scipy import stats as scipy_stats
 
     temp_type = bracket["temp_type"]
     bracket_low = bracket["temp_low_c"]
     bracket_high = bracket["temp_high_c"]
+    city = forecast["location"]
+    month = bracket["target_date"].month
 
     all_temps = forecast["forecast_temps"]
     if len(all_temps) >= 2:
@@ -167,22 +195,27 @@ def compute_bracket_probability(forecast: dict, bracket: dict) -> float:
     else:
         forecast_min = forecast_max = all_temps[0] if all_temps else 15.0
 
-    # Use the relevant forecast as the mean
+    city_climo = climo.get(city, {}).get(month)
+    if city_climo is None:
+        # Fallback: use all-city average climatology
+        max_stds = [c[m]["max_std"] for c in climo.values() for m in c if m == month]
+        min_stds = [c[m]["min_std"] for c in climo.values() for m in c if m == month]
+        max_std = sum(max_stds) / len(max_stds) if max_stds else 5.0
+        min_std = sum(min_stds) / len(min_stds) if min_stds else 5.0
+    else:
+        max_std = city_climo["max_std"]
+        min_std = city_climo["min_std"]
+
     if temp_type == "lowest":
         mean_temp = forecast_min
-        # Min temp forecasts have higher uncertainty
-        std_temp = 2.5 + abs(forecast_max - forecast_min) * 0.3
+        std_temp = max(min_std, 2.0)  # floor at 2°C
     else:
         mean_temp = forecast_max
-        std_temp = 1.8 + abs(forecast_max - forecast_min) * 0.3
-
-    # Ensure minimum spread
-    std_temp = max(std_temp, 1.5)
+        std_temp = max(max_std, 2.0)
 
     prob_in_bracket = scipy_stats.norm.cdf(bracket_high, loc=mean_temp, scale=std_temp) - \
                       scipy_stats.norm.cdf(bracket_low, loc=mean_temp, scale=std_temp)
 
-    # Clamp to avoid degenerate probabilities
     return max(0.02, min(0.98, prob_in_bracket))
 
 
@@ -191,18 +224,9 @@ def edge_score(our_prob: float, market_prob: float) -> float:
     return our_prob - market_prob
 
 
-def kelly_stake(bankroll: float, our_prob: float, market_prob: float) -> float:
-    """Kelly-optimal bet size in dollars."""
-    if market_prob <= 0 or market_prob >= 1:
-        return 0.0
-
-    odds = 1.0 / market_prob
-    kelly = (our_prob * odds - 1) / (odds - 1)
-    kelly = max(0, kelly * KELLY_FRACTION)  # 0.10 fractional
-
-    stake = kelly * bankroll
-    # Cap: 3% of bankroll or MAX_STAKE, whichever is smaller
-    return round(min(stake, bankroll * 0.03, MAX_STAKE), 2)
+def fixed_stake(bankroll: float) -> float:
+    """Flat 2% of bankroll per bet, capped at MAX_STAKE."""
+    return round(min(bankroll * 0.02, MAX_STAKE), 2)
 
 
 # ── Backtest runner ───────────────────────────────────────────────────────────
@@ -240,19 +264,24 @@ def run_backtest() -> pd.DataFrame:
         city = row["city"]
         weather_lookup[(city, date_str)] = weather_to_forecast_dict(row)
 
+    # Build city×month climatology for calibrated stds
+    climo = build_climatology(weather_df)
+    logger.info(f"Climatology built for {len(climo)} cities, "
+                f"avg max_std={sum(c[m]['max_std'] for c in climo.values() for m in c)/(len(climo)*12):.1f}°C")
+
     # 3. First pass: parse all markets, compute probabilities, group by city+date
-    baseline = 0.10  # uniform prior for neg-risk (~10 brackets)
-
-    # Market efficiency: how much of our model's information is already priced in.
-    # 0.0 = market is clueless (uniform 10%), 1.0 = market is perfectly efficient.
-    # Realistically, Polymarket traders use weather models too, so ~60-80% efficiency.
-    MARKET_EFFICIENCY = 0.70
-
     all_parsed = []
+    skipped_no_price = 0
     for _, market in resolved_df.iterrows():
         title = market.get("title", "")
         bracket = parse_market_title(title)
         if bracket is None:
+            continue
+
+        # Use real CLOB trade price as market probability
+        market_prob = market.get("market_prob")
+        if market_prob is None or (isinstance(market_prob, float) and np.isnan(market_prob)):
+            skipped_no_price += 1
             continue
 
         city = market["city"]
@@ -261,16 +290,8 @@ def run_backtest() -> pd.DataFrame:
         if forecast is None:
             continue
 
-        our_prob_raw = compute_bracket_probability(forecast, bracket)
+        our_prob = compute_bracket_probability(forecast, bracket, climo)
         confidence = calculate_confidence(forecast)
-
-        # Calibrate: shrink toward baseline to correct overconfidence
-        our_prob = 0.35 * our_prob_raw + 0.65 * baseline
-
-        # Market probability with efficiency: market already knows most of what we know
-        market_prob = baseline + MARKET_EFFICIENCY * (our_prob - baseline)
-        market_prob = max(0.02, min(0.95, market_prob))  # clamp
-
         edge = edge_score(our_prob, market_prob)
 
         all_parsed.append({
@@ -280,9 +301,13 @@ def run_backtest() -> pd.DataFrame:
             "city": city,
             "forecast": forecast,
             "our_prob": our_prob,
+            "market_prob": market_prob,
             "confidence": confidence,
             "edge": edge,
         })
+
+    if skipped_no_price:
+        logger.info(f"Skipped {skipped_no_price} markets without CLOB price data")
 
     # 4. Group by city+date: only bet on the single best bracket per group
     from collections import defaultdict
@@ -295,23 +320,29 @@ def run_backtest() -> pd.DataFrame:
     hwm = INITIAL_BANK
 
     for (city, target_date), group_items in groups.items():
-        # Sort by edge descending, pick the best one
-        group_items.sort(key=lambda x: x["edge"], reverse=True)
+        # Sort by our_prob descending — pick bracket where model is most confident
+        group_items.sort(key=lambda x: x["our_prob"], reverse=True)
         best = group_items[0]
 
-        # Also record all brackets for reporting (but only bet on best)
         our_prob = best["our_prob"]
+        market_prob = best["market_prob"]
         confidence = best["confidence"]
         edge = best["edge"]
         bracket = best["bracket"]
         market = best["market"]
         actual_outcome = int(market["actual_outcome"])
 
-        if edge > MIN_EDGE and confidence > MIN_CONFIDENCE:
-            stake = kelly_stake(bankroll, our_prob, market_prob)
+        # Bet NO when model is moderately overconfident.
+        # Sweet spot: our_prob 0.50-0.65 has actual NO rate ~91% (vs market 89%).
+        # Too-high prob (>0.7) has actual NO rate only ~75% — model accidentally finds signal.
+        bet_no = 0.50 < our_prob < 0.60
+
+        if bet_no and confidence > MIN_CONFIDENCE:
+            stake = fixed_stake(bankroll)
             if stake > 0:
-                if actual_outcome == 1:
-                    pnl = stake * (1.0 / market_prob - 1)
+                # Bet NO (short): model overconfident → bracket likely resolves NO
+                if actual_outcome == 0:
+                    pnl = stake * (1.0 / (1.0 - market_prob) - 1)
                     result = "WIN"
                 else:
                     pnl = -stake
@@ -324,9 +355,7 @@ def run_backtest() -> pd.DataFrame:
         else:
             stake = 0.0
             pnl = 0.0
-            if edge <= MIN_EDGE:
-                result = "LOW_EDGE"
-            elif confidence <= MIN_CONFIDENCE:
+            if not bet_no:
                 result = "LOW_CONF"
             else:
                 result = "NO_BET"
