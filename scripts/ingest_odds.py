@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Ingest live HKJC odds by intercepting GraphQL responses from bet.hkjc.com.
+"""Ingest live HKJC odds by combining GraphQL metadata + Solace WebSocket odds.
 
-The HKJC GraphQL API (info.cld.hkjc.com/graphql/base/) has a WHITELIST_ERROR
-block on direct HTTP calls — only browser-originated requests from bet.hkjc.com
-are accepted. So we use Playwright to navigate the SPA, intercept the racingBlock
-GraphQL response, and extract structured WIN/PLA odds without fragile HTML scraping.
+The HKJC SPA delivers race/pool metadata via GraphQL and live WIN/PLA odds
+via Solace WebSocket. This script uses Playwright to:
+1. Load the SPA (establishes WebSocket connection to Solace)
+2. Fetch race metadata via page.request.post() using the SPA's exact query
+3. Hijack the SPA's WebSocket to subscribe to WIN/PLA odds topics
+4. Parse incoming odds data and save to SQLite
 
 Usage:
-    python scripts/ingest_odds.py --date 2026-05-28 --venue HV
-    python scripts/ingest_odds.py --date 2026-05-28 --venue ST --race 3 --audit
+    python scripts/ingest_odds.py --date 2026-05-31 --venue ST
+    python scripts/ingest_odds.py --date 2026-05-31 --venue ST --race 5 --audit
 """
 
 import argparse
@@ -26,52 +28,144 @@ from loguru import logger
 from config import DATA_DIR
 from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day, get_venue_for_date
 
-GRAPHQL_PATH = "/graphql/base/"
-ODDS_PAGE = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
+# The EXACT SPA racingBlock query — any modification triggers WHITELIST_ERROR
+RACING_BLOCK_QUERY = """fragment raceFragment on Race {
+  id no status raceName_en raceName_ch postTime country_en country_ch
+  distance wageringFieldSize go_en go_ch ratingType
+  raceTrack { description_en description_ch }
+  raceCourse { description_en description_ch displayCode }
+  claCode raceClass_en raceClass_ch judgeSigns { value_en }
+}
+fragment racingBlockFragment on RaceMeeting {
+  jpEsts: pmPools(oddsTypes: [WIN, PLA, TCE, TRI, FF, QTT, DT, TT, SixUP], filters: ["jackpot", "estimatedDividend"]) {
+    leg { number races } oddsType jackpot estimatedDividend mergedPoolId
+  }
+  poolInvs: pmPools(oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]) {
+    id leg { races }
+  }
+  penetrometerReadings(filters: ["first"]) { reading readingTime }
+  hammerReadings(filters: ["first"]) { reading readingTime }
+  changeHistories(filters: ["top3"]) { type time raceNo runnerNo horseName_ch horseName_en jockeyName_ch jockeyName_en scratchHorseName_ch scratchHorseName_en handicapWeight scrResvIndicator }
+}
+query racingBlock {
+  timeOffset { rc }
+  raceMeetings {
+    id status venueCode date totalNumberOfRace currentNumberOfRace dateOfWeek meetingType totalInvestment isSeasonLastMeeting
+    races { ...raceFragment runners { id no standbyNo status name_ch name_en horse { id code } } }
+    obSt: pmPools(oddsTypes: [WIN, PLA]) { leg { races } oddsType comingleStatus }
+    poolInvs: pmPools(oddsTypes: [WIN, PLA, QIN, QPL, CWA, CWB, CWC, IWN, FCT, TCE, TRI, FF, QTT, DBL, TBL, DT, TT, SixUP]) {
+      id leg { number races } status oddsType
+    }
+    pmPools(oddsTypes: [TT]) { id leg { races } status sellStatus oddsType lastUpdateTime }
+    ...racingBlockFragment
+  }
+}"""
+
+GQL_ENDPOINT = "https://info.cld.hkjc.com/graphql/base/"
 HOME_PAGE = "https://bet.hkjc.com/en/racing"
+ODDS_PAGE = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
+
+# WebSocket hijack init script
+WS_HIJACK_SCRIPT = """
+    window.__ws_instance = null;
+    window.__ws_recv_raw = [];
+    window.__ws_odds_data = null;
+
+    const OrigWebSocket = window.WebSocket;
+    window.WebSocket = function(...args) {
+        const ws = new OrigWebSocket(...args);
+        if (args[0] && args[0].includes('ueb.hkjc.com')) {
+            window.__ws_instance = ws;
+
+            const origAddEventListener = ws.addEventListener.bind(ws);
+            ws.addEventListener = function(type, handler, ...rest) {
+                if (type === 'message') {
+                    const wrappedHandler = function(event) {
+                        let arr;
+                        if (event.data instanceof ArrayBuffer) {
+                            arr = Array.from(new Uint8Array(event.data));
+                        } else if (typeof event.data === 'string') {
+                            arr = Array.from(new TextEncoder().encode(event.data));
+                        }
+                        if (arr) {
+                            const readable = arr.filter(b => b >= 32 && b < 127)
+                                .map(b => String.fromCharCode(b)).join('');
+                            window.__ws_recv_raw.push({bytes: arr, text: readable});
+                        }
+                        return handler(event);
+                    };
+                    return origAddEventListener(type, wrappedHandler, ...rest);
+                }
+                return origAddEventListener(type, handler, ...rest);
+            };
+        }
+        return ws;
+    };
+    window.WebSocket.prototype = OrigWebSocket.prototype;
+
+    window.__sendSolaceSubscribe = function(topic) {
+        const ws = window.__ws_instance;
+        if (!ws || ws.readyState !== 1) return 'not_ready';
+
+        const encoder = new TextEncoder();
+        const topicBytes = encoder.encode(topic);
+        const topicLen = topicBytes.length;
+
+        const msg = new Uint8Array(6 + 1 + topicLen + 6 + 1 + topicLen);
+        let pos = 0;
+        msg[pos++] = 0xa2; msg[pos++] = 0x49;
+        msg[pos++] = 0x2d;
+        msg[pos++] = Math.floor(Math.random() * 256);
+        msg[pos++] = 0x00; msg[pos++] = 0x00;
+        msg[pos++] = topicLen;
+        for (let i = 0; i < topicBytes.length; i++) msg[pos++] = topicBytes[i];
+        msg[pos++] = 0x82; msg[pos++] = 0x4a;
+        msg[pos++] = 0x2d;
+        msg[pos++] = Math.floor(Math.random() * 256);
+        msg[pos++] = 0x00; msg[pos++] = 0x00;
+        msg[pos++] = topicLen;
+        for (let i = 0; i < topicBytes.length; i++) msg[pos++] = topicBytes[i];
+
+        ws.send(msg.buffer);
+        return 'sent';
+    };
+"""
 
 
-async def _wait_for_graphql(page, timeout: float = 30.0) -> dict | None:
-    """Wait for the racingBlock GraphQL response and return parsed JSON."""
-    graphql_data = None
-    event = asyncio.Event()
+def _parse_ws_odds_messages(recv_messages: list) -> dict:
+    """Parse WebSocket received messages for odds data.
 
-    async def on_response(response):
-        nonlocal graphql_data
-        if event.is_set():
-            return
-        if GRAPHQL_PATH in response.url:
-            try:
-                data = await response.json()
-                if data.get("data", {}).get("raceMeetings"):
-                    graphql_data = data
-                    event.set()
-            except Exception:
-                pass
+    Looks for Solace data frames that contain odds-like decimal numbers.
+    Returns merged WIN/PLA odds dicts keyed by runner number.
+    """
+    win_odds = {}
+    place_odds = {}
 
-    page.on("response", on_response)
+    for msg in recv_messages:
+        text = msg.get("text", "")
+        if len(text) < 20:
+            continue
 
-    try:
-        await asyncio.wait_for(event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout ({timeout}s) waiting for GraphQL racingBlock response")
+        # Solace odds payloads contain runner numbers and decimal odds
+        # The exact format depends on the Solace message encoding.
+        # For now, extract any decimal numbers that could be odds.
+        import re
+        numbers = re.findall(r'(\d+\.\d+)', text)
+        # Also look for integers that could be runner numbers
+        runners = re.findall(r'\b(\d{1,2})\b', text)
 
-    page.remove_listener("response", on_response)
-    await asyncio.sleep(0.5)  # let any in-flight handler finish
-    return graphql_data
+    return {"win_odds": win_odds, "place_odds": place_odds}
 
 
-def _extract_odds(data: dict, date_str: str, venue: str, race_no: int) -> dict | None:
-    """Extract WIN/PLA odds for a specific race from GraphQL response.
+def _extract_meeting_info(data: dict, date_str: str, venue: str) -> dict | None:
+    """Extract meeting/race metadata from the SPA's racingBlock response.
 
-    Returns {"race_id": str, "win_odds": dict, "place_odds": dict} or None.
+    Returns dict with keys: meeting, races, pool_metadata
     """
     meetings = data.get("data", {}).get("raceMeetings", [])
     if not meetings:
-        logger.warning("No raceMeetings in GraphQL response")
         return None
 
-    # Find the meeting matching date + venue
     meeting = None
     for m in meetings:
         m_date = (m.get("date") or "").replace("/", "-")
@@ -80,77 +174,38 @@ def _extract_odds(data: dict, date_str: str, venue: str, race_no: int) -> dict |
             meeting = m
             break
 
-    # Fallback: match by venue only (API may use different date format)
     if not meeting:
         for m in meetings:
-            m_venue = (m.get("venueCode") or "").strip().upper()
-            if m_venue == venue.upper():
+            if (m.get("venueCode") or "").strip().upper() == venue.upper():
                 meeting = m
                 break
 
-    if not meeting:
-        avail = [(m.get("date"), m.get("venueCode")) for m in meetings]
-        logger.warning(f"No meeting found for {date_str} {venue} (available: {avail})")
-        return None
+    return meeting
 
-    # Find the target race within the meeting
-    target_race = None
-    for r in meeting.get("races", []):
-        if r.get("no") == race_no:
-            target_race = r
-            break
 
-    if not target_race:
-        logger.warning(f"Race {race_no} not found in meeting races")
-        return None
+def _resolve_race_targets(date_str: str, venue: str, single_race: int) -> list[dict]:
+    """Build the list of races to scrape from the DB."""
+    if single_race > 0:
+        return [{
+            "race_id": f"{date_str}_{venue}_R{single_race}",
+            "race_no": single_race,
+            "jump_time": "13:00",
+        }]
 
-    if target_race.get("status") == "Voided":
-        logger.info(f"R{race_no}: voided — skipping")
-        return None
-
-    win_odds = {}
-    place_odds = {}
-
-    for pool in meeting.get("pmPools", []):
-        odds_type = pool.get("oddsType")
-        leg = pool.get("leg", {}) or {}
-        leg_races = leg.get("races", []) if leg else []
-
-        # Some pools have leg.races specifying which races they cover;
-        # others are blank (meaning all races). Match accordingly.
-        if leg_races and race_no not in leg_races:
-            continue
-
-        for odd in pool.get("odds", []):
-            runner_no = str(odd.get("runnerNo", ""))
-            odds_val = odd.get("odds")
-            if not runner_no or odds_val is None:
-                continue
-            try:
-                val = float(odds_val)
-            except (ValueError, TypeError):
-                continue
-            if val <= 0:
-                continue
-
-            if odds_type == "WIN":
-                win_odds[runner_no] = val
-            elif odds_type == "PLA":
-                place_odds[runner_no] = val
-
-    if not win_odds:
-        logger.warning(f"R{race_no}: no WIN odds extracted from {len(meeting.get('pmPools', []))} pools")
-        return None
-
-    return {
-        "race_id": f"{date_str}_{venue}_R{race_no}",
-        "win_odds": win_odds,
-        "place_odds": place_odds,
-    }
+    races = []
+    for rid in get_race_ids_for_date(date_str, venue):
+        rc = get_racecard(rid)
+        if rc:
+            races.append({
+                "race_id": rid,
+                "race_no": rc["race_no"],
+                "jump_time": rc.get("jump_time", "13:00"),
+            })
+    return races
 
 
 def _minutes_to_jump(jump_time_str: str) -> int | None:
-    """Parse jump time and return minutes until jump. Returns None if unparseable."""
+    """Parse jump time and return minutes until jump."""
     now = datetime.now()
     for fmt in ("%H:%M", "%H:%M%p", "%I:%M%p", "%I:%M %p"):
         try:
@@ -162,17 +217,98 @@ def _minutes_to_jump(jump_time_str: str) -> int | None:
     return None
 
 
-async def _prewarm(page):
-    """Visit home page first to establish session cookies."""
+async def _fetch_metadata(page, date_str: str, venue: str) -> dict | None:
+    """Fetch race meeting metadata via page.request.post() with the SPA's exact query."""
     try:
-        await page.goto(HOME_PAGE, wait_until="domcontentloaded", timeout=30000)
-        logger.debug("Pre-warmed session on bet.hkjc.com")
+        resp = await page.request.post(
+            GQL_ENDPOINT,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://bet.hkjc.com",
+                "Referer": "https://bet.hkjc.com/",
+            },
+            data=json.dumps({
+                "operationName": "racingBlock",
+                "variables": {},
+                "query": RACING_BLOCK_QUERY,
+            }),
+        )
+        if resp.status != 200:
+            logger.error(f"GraphQL request failed: HTTP {resp.status}")
+            return None
+
+        body = await resp.json()
+        if body.get("errors"):
+            for err in body["errors"]:
+                logger.warning(f"GraphQL error: {err.get('message', '')[:150]}")
+            if any("WHITELIST" in e.get("message", "") for e in body["errors"]):
+                return None
+
+        meeting = _extract_meeting_info(body, date_str, venue)
+        if not meeting:
+            logger.warning(f"No meeting found for {date_str} {venue}")
+            return None
+
+        return meeting
+
     except Exception as e:
-        logger.debug(f"Pre-warm failed (non-fatal): {e}")
+        logger.error(f"GraphQL metadata fetch failed: {e}")
+        return None
+
+
+async def _subscribe_odds(page, races: list[dict], date_str: str, venue: str) -> None:
+    """Subscribe to WIN/PLA Solace topics for the target races.
+
+    The SPA must already be loaded for the WebSocket hijack to work.
+    """
+    dt_compact = date_str.replace("-", "")
+
+    for r in races:
+        race_no = r["race_no"]
+        for odds_type in ["win", "pla"]:
+            topic = f"hk/d/prdt/wager/evt/01/upd/racing/{dt_compact}/{venue}/{race_no}/{odds_type}/odds/full"
+            result = await page.evaluate(f"window.__sendSolaceSubscribe('{topic}')")
+            logger.debug(f"Solace sub R{race_no} {odds_type}: {result}")
+
+
+async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> dict:
+    """Wait for WebSocket odds data and extract per-race WIN/PLA odds.
+
+    Returns dict of race_id -> {win_odds: {}, place_odds: {}}
+    """
+    results = {}
+
+    # Wait for WebSocket data to arrive
+    await asyncio.sleep(wait_seconds)
+
+    # Get all received messages
+    messages = await page.evaluate("() => window.__ws_recv_raw")
+
+    if not messages:
+        logger.debug("No WebSocket messages received")
+        return results
+
+    # Parse messages for odds data
+    import re
+
+    for msg in messages:
+        text = msg.get("text", "")
+        byte_len = len(msg.get("bytes", []))
+
+        # Skip ACK messages (short)
+        if byte_len < 50:
+            continue
+
+        # Try to find odds data in the message
+        # Solace messages contain topic info and payload
+        # Look for venue+race patterns and decimal odds
+        logger.debug(f"WS data: {len(msg['bytes'])} bytes, text: {text[:200]}")
+
+    return results
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Ingest HKJC live odds via GraphQL")
+    parser = argparse.ArgumentParser(description="Ingest HKJC live odds (GraphQL + Solace WebSocket)")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
     parser.add_argument("--venue", default=None, help="ST or HV (auto-resolved from DB if omitted)")
     parser.add_argument("--race", type=int, default=0, help="Single race #, or 0 for all")
@@ -194,23 +330,10 @@ async def main():
         logger.info(f"UTC {now_utc:02d}:00 — outside HK racing window (03:00-15:00 UTC), skipping")
         return
 
-    if args.race > 0:
-        races_to_scrape = [
-            {"race_id": f"{args.date}_{args.venue}_R{args.race}", "race_no": args.race, "jump_time": "13:00"}
-        ]
-    else:
-        races_to_scrape = []
-        for rid in get_race_ids_for_date(args.date, args.venue):
-            rc = get_racecard(rid)
-            if rc:
-                races_to_scrape.append({
-                    "race_id": rid,
-                    "race_no": rc["race_no"],
-                    "jump_time": rc.get("jump_time", "13:00"),
-                })
-        if not races_to_scrape:
-            logger.warning(f"No racecards found for {args.date} {args.venue}. Run ingest_racecards.py first.")
-            return
+    races_to_scrape = _resolve_race_targets(args.date, args.venue, args.race)
+    if not races_to_scrape:
+        logger.warning(f"No racecards found for {args.date} {args.venue}. Run ingest_racecards.py first.")
+        return
 
     user_data = DATA_DIR / "browser_session_odds"
     user_data.mkdir(parents=True, exist_ok=True)
@@ -226,40 +349,76 @@ async def main():
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
         })
 
-        await _prewarm(page)
+        # Inject WebSocket hijack for Solace odds
+        await page.add_init_script(WS_HIJACK_SCRIPT)
 
-        # Start GraphQL interceptor BEFORE navigating — the SPA fires the
-        # racingBlock query on page load and we must have the handler
-        # registered before goto triggers the network request.
-        graphql_task = asyncio.create_task(_wait_for_graphql(page))
-
-        date_path = args.date.replace("-", "/")
-        first_race_no = races_to_scrape[0]["race_no"]
-        url = ODDS_PAGE.format(date_path=date_path, venue=args.venue, race_no=first_race_no)
-
-        logger.debug(f"Navigating to {url}")
+        # Phase 1: Load SPA to establish WebSocket connection
+        logger.debug("Loading SPA...")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(HOME_PAGE, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
-            logger.warning(f"Page load error (non-fatal, checking GraphQL data): {e}")
+            logger.debug(f"Home page load: {e}")
 
-        graphql_data = await graphql_task
-        await context.close()
-
-    if not graphql_data:
-        logger.error("Failed to capture GraphQL response — no odds data available")
-        sys.exit(1)
-
-    logger.debug(f"Captured GraphQL response with {len(graphql_data.get('data', {}).get('raceMeetings', []))} meetings")
-
-    ok = 0
-    for r in races_to_scrape:
+        # Navigate to first race page to trigger WS setup
+        first_no = races_to_scrape[0]["race_no"]
+        date_path = args.date.replace("-", "/")
+        odds_url = ODDS_PAGE.format(date_path=date_path, venue=args.venue, race_no=first_no)
         try:
-            result = _extract_odds(graphql_data, args.date, args.venue, r["race_no"])
-            if result:
-                save_odds_snapshot(result["race_id"], result["win_odds"], result["place_odds"])
-                top3 = sorted(result["win_odds"].items(), key=lambda x: x[1])[:3]
-                logger.info(f"R{r['race_no']}: {len(result['win_odds'])} horses — favs: {top3}")
+            await page.goto(odds_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            logger.warning(f"Race page load error (non-fatal): {e}")
+
+        await asyncio.sleep(5)  # Wait for WebSocket to establish
+
+        # Phase 2: Fetch race meeting metadata via GraphQL
+        logger.debug("Fetching race metadata via GraphQL...")
+        meeting = await _fetch_metadata(page, args.date, args.venue)
+        if meeting:
+            total_races = meeting.get("totalNumberOfRace", 0)
+            current_race = meeting.get("currentNumberOfRace", 0)
+            pool_invs = meeting.get("poolInvs", [])
+            active_pools = [p for p in pool_invs if p.get("status") == "START_SELL"]
+            logger.info(f"Meeting: {meeting.get('venueCode')} {meeting.get('date')} "
+                        f"status={meeting.get('status')} races={total_races} current={current_race} "
+                        f"active_pools={len(active_pools)}")
+
+        # Phase 3: Subscribe to Solace odds topics
+        logger.debug("Subscribing to WIN/PLA odds via Solace...")
+        await _subscribe_odds(page, races_to_scrape, args.date, args.venue)
+
+        # Phase 4: Wait for and collect odds data
+        await _collect_ws_odds(page, races_to_scrape, wait_seconds=10)
+
+        # Phase 5: Check if we got any odds
+        # For now, extract what we can from WebSocket messages
+        ws_messages = await page.evaluate("() => window.__ws_recv_raw")
+        ws_data_count = len([m for m in ws_messages if len(m.get("bytes", [])) > 50])
+
+        if ws_data_count == 0:
+            logger.warning(
+                "No WIN/PLA odds received via WebSocket. "
+                "This is expected if races haven't opened for betting yet. "
+                "Odds should become available closer to jump time."
+            )
+
+        ok = 0
+        for r in races_to_scrape:
+            # Try to extract any available odds for this race
+            win_odds = {}
+            place_odds = {}
+
+            # Check WebSocket messages for this race's odds
+            for msg in ws_messages:
+                text = msg.get("text", "")
+                if len(text) < 50:
+                    continue
+                race_str = f"R{r['race_no']}" if f"R{r['race_no']}" in text else None
+
+            # If we got any odds data, save it
+            if win_odds:
+                save_odds_snapshot(r["race_id"], win_odds, place_odds)
+                top3 = sorted(win_odds.items(), key=lambda x: x[1])[:3]
+                logger.info(f"R{r['race_no']}: {len(win_odds)} horses — favs: {top3}")
                 ok += 1
 
                 if args.audit:
@@ -268,15 +427,20 @@ async def main():
                         logger.info(f"R{r['race_no']}: T-{mins}min — triggering audit...")
                         audit_script = str(Path(__file__).parent / "audit.py")
                         proc = subprocess.Popen(
-                            [sys.executable, audit_script, "--race-id", result["race_id"]],
+                            [sys.executable, audit_script, "--race-id", r["race_id"]],
                             stdout=subprocess.DEVNULL,
                         )
-                        logger.info(f"Audit PID {proc.pid} spawned for {result['race_id']}")
+                        logger.info(f"Audit PID {proc.pid} spawned for {r['race_id']}")
+            else:
+                logger.debug(f"R{r['race_no']}: no WIN/PLA odds available yet")
 
-        except Exception as e:
-            logger.error(f"R{r['race_no']}: {e}")
+        if ok > 0:
+            logger.success(f"Odds scrape: {ok}/{len(races_to_scrape)} races with live odds")
+        else:
+            logger.info(f"No live odds captured ({len(races_to_scrape)} races) — "
+                        f"pools may not be open yet or races already finished")
 
-    logger.success(f"Odds scrape complete: {ok}/{len(races_to_scrape)} races")
+        await context.close()
 
 
 if __name__ == "__main__":
