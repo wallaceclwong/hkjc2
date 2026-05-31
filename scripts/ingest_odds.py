@@ -16,6 +16,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -23,10 +24,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from loguru import logger
-from config import DATA_DIR
+from config import BASE_DIR, DATA_DIR
 from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day, get_venue_for_date
+
+load_dotenv(BASE_DIR / ".env")
 
 # The EXACT SPA racingBlock query — any modification triggers WHITELIST_ERROR
 RACING_BLOCK_QUERY = """fragment raceFragment on Race {
@@ -307,6 +311,156 @@ async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> d
     return results
 
 
+async def _hkjc_login(page, context) -> bool:
+    """Log into HKJC betting account via SPA's ForgeRock SSO flow.
+
+    The HKJC SPA uses ForgeRock AM with 2FA (SMS OTP). This function:
+    1. Checks if already authenticated (SSO check)
+    2. Fills username/password in the SPA login form
+    3. Triggers login via the SPA's own JavaScript
+    4. If OTP is required, submits the OTP from env or prompts user
+    5. Returns True on successful SSO sign-in
+    """
+    account = os.getenv("HKJC_ACCOUNT", "")
+    password = os.getenv("HKJC_PASSWORD", "")
+    otp_code = os.getenv("HKJC_OTP", "")  # pre-provided OTP if available
+
+    if not account or not password or account == "YOUR_ACCOUNT_ID":
+        logger.debug("No HKJC credentials set — skipping login")
+        return False
+
+    # Quick check: are we already authenticated?
+    try:
+        resp = await page.request.post(
+            "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+            headers={"Content-Type": "application/json"},
+            data='{"knownWebID":"","knownSSOGUID":"","isNew":true}',
+        )
+        sso = await resp.text()
+        if "SSO_SIGN_IN" in sso and "NOT_SIGN_IN" not in sso:
+            logger.info("HKJC: already authenticated")
+            return True
+    except Exception:
+        pass
+
+    logger.info("Logging into HKJC (ForgeRock SSO)...")
+
+    try:
+        # Load login page
+        await page.goto("https://bet.hkjc.com/en/racing/login",
+                        wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
+
+        # Check if login form exists
+        account_input = await page.query_selector("#login-account-input")
+        if not account_input:
+            logger.debug("No login form — may already be authenticated")
+            return True
+
+        # Fill credentials using native setter + React events
+        logger.debug("Filling credentials...")
+        await page.evaluate(f"""
+            () => {{
+                for (const [id, val] of [
+                    ['#login-account-input', '{account}'],
+                    ['#login-password-input', '{password}']
+                ]) {{
+                    const input = document.querySelector(id);
+                    const ns = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    ns.call(input, val);
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}
+            }}
+        """)
+        await asyncio.sleep(1)
+
+        # Trigger login by pressing Enter on password field
+        # (the SPA handles the entire ForgeRock flow via its own JS)
+        await page.focus("#login-password-input")
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(5)
+
+        # Check if OTP input appeared (stage=otp — 6 single-digit boxes)
+        otp_boxes = await page.evaluate("""() => {
+            const inputs = document.querySelectorAll('input.otp-input, [class*="otp"] input[type="number"]');
+            if (inputs.length >= 4) {
+                return inputs.length;
+            }
+            return 0;
+        }""")
+
+        if otp_boxes:
+            logger.info(f"OTP required — {otp_boxes} digit boxes detected")
+
+            if not otp_code:
+                logger.error("HKJC_OTP not set in .env — cannot complete 2FA")
+                return False
+
+            if len(otp_code) != otp_boxes:
+                logger.warning(f"OTP length ({len(otp_code)}) != boxes ({otp_boxes}), truncating")
+
+            logger.debug("Filling OTP digits via native events...")
+            await page.evaluate(f"""
+                () => {{
+                    const boxes = document.querySelectorAll('input.otp-input, [class*="otp"] input[type="number"]');
+                    const digits = '{otp_code}';
+                    for (let i = 0; i < Math.min(digits.length, boxes.length); i++) {{
+                        const ns = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        ns.call(boxes[i], digits[i]);
+                        boxes[i].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        boxes[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }}
+                }}
+            """)
+            await asyncio.sleep(0.5)
+
+            # Click submit/next after OTP
+            submitted = await page.evaluate("""() => {
+                const btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
+                for (const b of btns) {
+                    const t = (b.innerText || b.value || '').trim().toUpperCase();
+                    if (['NEXT', 'SUBMIT', 'VERIFY', 'CONFIRM', 'LOGIN', 'LOG IN', 'OK'].includes(t) && !b.disabled) {
+                        b.click();
+                        return 'clicked: ' + t;
+                    }
+                }
+                // Try pressing Enter on last OTP box
+                const boxes = document.querySelectorAll('input.otp-input');
+                if (boxes.length > 0) {
+                    boxes[boxes.length - 1].dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+                    return 'enter on last box';
+                }
+                return 'no submit found';
+            }""")
+            logger.debug(f"OTP submit: {submitted}")
+            await asyncio.sleep(3)
+        else:
+            logger.debug("No OTP prompt detected — login may be password-only")
+
+        # Verify SSO after login
+        await asyncio.sleep(3)
+        resp = await page.request.post(
+            "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+            headers={"Content-Type": "application/json"},
+            data='{"knownWebID":"","knownSSOGUID":"","isNew":true}',
+        )
+        sso = await resp.text()
+
+        if "SSO_SIGN_IN" in sso and "NOT_SIGN_IN" not in sso:
+            logger.success("HKJC login successful!")
+            return True
+        else:
+            logger.warning(f"HKJC login failed. SSO: {sso[:200]}")
+            return False
+
+    except Exception as e:
+        logger.error(f"HKJC login error: {e}")
+        return False
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Ingest HKJC live odds (GraphQL + Solace WebSocket)")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
@@ -351,6 +505,9 @@ async def main():
 
         # Inject WebSocket hijack for Solace odds
         await page.add_init_script(WS_HIJACK_SCRIPT)
+
+        # Authenticate with HKJC to access live odds
+        await _hkjc_login(page, context)
 
         # Phase 1: Load SPA to establish WebSocket connection
         logger.debug("Loading SPA...")
