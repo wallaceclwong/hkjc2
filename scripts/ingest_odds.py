@@ -68,7 +68,7 @@ query racingBlock {
 
 GQL_ENDPOINT = "https://info.cld.hkjc.com/graphql/base/"
 HOME_PAGE = "https://bet.hkjc.com/en/racing"
-ODDS_PAGE = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
+ODDS_PAGE = "https://bet.hkjc.com/en/racing/wp/{date}/{venue}/{race_no}"
 
 # WebSocket hijack init script
 WS_HIJACK_SCRIPT = """
@@ -413,6 +413,89 @@ async def _fetch_metadata(page, date_str: str, venue: str) -> dict | None:
         return None
 
 
+async def _scrape_odds_from_page(page, date_str: str, venue: str, race_no: int) -> dict:
+    """Scrape WIN/PLA odds from the SPA WP page DOM.
+
+    The WP page renders odds in a text table:
+      Horse number (line)
+      Horse name + draw + weight + jockey + trainer (line)
+      WIN odds (line)
+      PLACE odds (line)
+      [empty line]
+
+    Returns {"win_odds": {runner: price}, "place_odds": {runner: price}}
+    """
+    url = ODDS_PAGE.format(date=date_str, venue=venue, race_no=race_no)
+    try:
+        await page.goto(url, timeout=30000)
+        await asyncio.sleep(8)  # Generous wait for SPA to render
+    except Exception:
+        logger.debug(f"R{race_no}: page load warning, continuing")
+
+    lines = await page.evaluate("""() => {
+        return document.body.innerText.split('\\n').map(l => l.trim());
+    }""")
+
+    if len(lines) < 50:
+        logger.warning(f"R{race_no}: only {len(lines)} lines — page may have redirected")
+
+    win_odds = {}
+    place_odds = {}
+
+    # Find the horse table header to anchor parsing
+    # Format: "No. Colour Horse Name Draw Wt. Jockey Trainer Win Place Win & Place"
+    header_idx = None
+    for i, line in enumerate(lines):
+        if "Horse Name" in line and "Draw" in line and "Win" in line:
+            header_idx = i
+            break
+
+    if header_idx is None:
+        # Debug: show lines that might contain part of the header
+        candidates = [l for l in lines if "Horse" in l or "Colour" in l or "Draw" in l[:50]]
+        logger.debug(
+            f"R{race_no}: could not find horse table header "
+            f"(lines={len(lines)}, candidates={len(candidates)}: {candidates[:3]})"
+        )
+        return {"win_odds": win_odds, "place_odds": place_odds}
+
+    # Parse horse rows starting after the header
+    # Pattern: horse_no -> name+details -> WIN odds -> PLACE odds -> [blank]
+    i = header_idx + 1
+    while i < len(lines) - 3:
+        horse_line = lines[i]
+        if horse_line.isdigit() and 1 <= int(horse_line) <= 14:
+            runner_no = horse_line
+            name_line = lines[i + 1]
+            win_line = lines[i + 2]
+            place_line = lines[i + 3]
+
+            # Name line should be longer than ~10 chars (contains horse name + draw + wt + jockey + trainer)
+            # Win/Place lines should be parseable as numbers
+            if (name_line and len(name_line) > 10 and
+                win_line.replace(".", "").replace(",", "").replace("-", "").isdigit() and
+                place_line.replace(".", "").replace(",", "").replace("-", "").isdigit()):
+
+                try:
+                    win_val = float(win_line.replace(",", ""))
+                    place_val = float(place_line.replace(",", ""))
+                    # Sanity: odds should be reasonable (not pool totals in millions)
+                    if 1.0 <= win_val <= 999 and 1.0 <= place_val <= 999:
+                        win_odds[runner_no] = win_val
+                        place_odds[runner_no] = place_val
+                        i += 5  # Skip blank line after place odds
+                        continue
+                except ValueError:
+                    pass
+        i += 1
+
+    logger.debug(
+        f"R{race_no} scraped: {len(win_odds)} WIN, {len(place_odds)} PLA "
+        f"from {len(lines)} lines"
+    )
+    return {"win_odds": win_odds, "place_odds": place_odds}
+
+
 async def _subscribe_odds(page, races: list[dict], date_str: str, venue: str) -> None:
     """Subscribe to WIN/PLA Solace topics for the target races.
 
@@ -726,25 +809,7 @@ async def main():
         # Authenticate with HKJC to access live odds
         await _hkjc_login(page, context)
 
-        # Phase 1: Load SPA to establish WebSocket connection
-        logger.debug("Loading SPA...")
-        try:
-            await page.goto(HOME_PAGE, wait_until="domcontentloaded", timeout=30000)
-        except Exception as e:
-            logger.debug(f"Home page load: {e}")
-
-        # Navigate to first race page to trigger WS setup
-        first_no = races_to_scrape[0]["race_no"]
-        date_path = args.date.replace("-", "/")
-        odds_url = ODDS_PAGE.format(date_path=date_path, venue=args.venue, race_no=first_no)
-        try:
-            await page.goto(odds_url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            logger.warning(f"Race page load error (non-fatal): {e}")
-
-        await asyncio.sleep(5)  # Wait for WebSocket to establish
-
-        # Phase 2: Fetch race meeting metadata via GraphQL
+        # Phase 1: Fetch race meeting metadata via GraphQL (no page load needed)
         logger.debug("Fetching race metadata via GraphQL...")
         meeting = await _fetch_metadata(page, args.date, args.venue)
         if meeting:
@@ -756,28 +821,12 @@ async def main():
                         f"status={meeting.get('status')} races={total_races} current={current_race} "
                         f"active_pools={len(active_pools)}")
 
-        # Phase 3: Subscribe to Solace odds topics
-        logger.debug("Subscribing to WIN/PLA odds via Solace...")
-        await _subscribe_odds(page, races_to_scrape, args.date, args.venue)
-
-        # Phase 4: Collect odds data from WebSocket
-        parsed_odds = await _collect_ws_odds(page, races_to_scrape, wait_seconds=10)
-
-        # Phase 5: Save parsed odds to database
-        # Get raw messages for debugging if parsing failed
-        stats = await page.evaluate("() => window.__getMessageStats()")
-
-        if stats["data"] == 0:
-            logger.warning(
-                "No WIN/PLA odds received via WebSocket. "
-                "This is expected if races haven't opened for betting yet. "
-                "Odds should become available closer to jump time."
-            )
-
+        # Phase 3: Scrape odds from WP pages (primary method — always works)
+        logger.debug("Scraping WIN/PLA odds from SPA pages...")
         ok = 0
         for r in races_to_scrape:
             race_no = r["race_no"]
-            race_odds = parsed_odds.get(race_no, {})
+            race_odds = await _scrape_odds_from_page(page, args.date, args.venue, race_no)
 
             win_odds = race_odds.get("win_odds", {})
             place_odds = race_odds.get("place_odds", {})
@@ -804,15 +853,15 @@ async def main():
             else:
                 logger.debug(f"R{race_no}: no WIN/PLA odds available yet")
 
+        # Also subscribe to Solace for live updates (non-blocking)
+        try:
+            await _subscribe_odds(page, races_to_scrape, args.date, args.venue)
+        except Exception:
+            pass
+
         if ok > 0:
-            logger.success(f"Odds scrape: {ok}/{len(races_to_scrape)} races with live odds ({stats['data']} WS data msgs, {stats['ack']} ACKs)")
+            logger.success(f"Odds scrape: {ok}/{len(races_to_scrape)} races with live odds")
         else:
-            # Dump sample data messages for debugging
-            data_msgs = await page.evaluate("() => window.__getDataMessages()")
-            if data_msgs:
-                logger.debug(f"No odds parsed. {len(data_msgs)} data messages. Sample texts:")
-                for i, msg in enumerate(data_msgs[:3]):
-                    logger.debug(f"  [{i}] {msg['len']}b: {msg.get('text','')[:250]}")
             logger.info(f"No live odds captured ({len(races_to_scrape)} races) — "
                         f"pools may not be open yet or races already finished")
 

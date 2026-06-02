@@ -8,9 +8,10 @@ from playwright.async_api import async_playwright
 from config import BASE_DIR, DATA_DIR
 from db import init_db
 from scripts.ingest_odds import (
-    _hkjc_login, _fetch_metadata, _subscribe_odds, _collect_ws_odds,
+    _hkjc_login, _fetch_metadata, _scrape_odds_from_page,
     _resolve_race_targets, WS_HIJACK_SCRIPT, HOME_PAGE, ODDS_PAGE
 )
+from db import save_odds_snapshot
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -42,14 +43,7 @@ async def main():
             await ctx.close()
             return
 
-        # Load SPA
-        await page.goto(HOME_PAGE, wait_until="domcontentloaded", timeout=30000)
-        date_path = date_str.replace("-", "/")
-        odds_url = ODDS_PAGE.format(date_path=date_path, venue=venue, race_no=1)
-        await page.goto(odds_url, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(5)
-
-        # GraphQL
+        # GraphQL metadata (doesn't need any specific page loaded)
         print("GraphQL metadata...")
         meeting = await _fetch_metadata(page, date_str, venue)
         if meeting:
@@ -62,33 +56,28 @@ async def main():
         else:
             print("  No metadata")
 
-        # Subscribe
-        print(f"Subscribing to {len(races) * 2} topics (WIN+PLA)...")
-        await _subscribe_odds(page, races, date_str, venue)
-        await asyncio.sleep(3)
+        # Scrape odds from WP pages (primary method)
+        print(f"Scraping odds for {len(races)} races...")
+        ok = 0
+        for r in races:
+            race_no = r["race_no"]
+            race_odds = await _scrape_odds_from_page(page, date_str, venue, race_no)
+            win = race_odds.get("win_odds", {})
+            pla = race_odds.get("place_odds", {})
 
-        # Collect
-        print("Collecting odds (45s)...")
-        results = await _collect_ws_odds(page, races, wait_seconds=45)
-
-        stats = await page.evaluate("() => window.__getMessageStats()")
-        print(f"WS: total={stats['total']} ack={stats['ack']} data={stats['data']}")
-
-        if results:
-            for race_no, data in sorted(results.items()):
-                win = data.get("win_odds", {})
-                pla = data.get("place_odds", {})
-                if win:
-                    top = sorted(win.items(), key=lambda x: x[1])[:5]
-                    print(f"R{race_no} WIN ({len(win)}): {top}")
+            if win:
+                save_odds_snapshot(r["race_id"], win, pla)
+                top = sorted(win.items(), key=lambda x: x[1])[:5]
+                print(f"R{race_no} WIN ({len(win)}): {top}")
                 if pla:
-                    top = sorted(pla.items(), key=lambda x: x[1])[:5]
-                    print(f"R{race_no} PLA ({len(pla)}): {top}")
-        else:
-            data_msgs = await page.evaluate("() => window.__getDataMessages()")
-            print(f"No odds parsed. {len(data_msgs)} data messages:")
-            for i, msg in enumerate(data_msgs[:5]):
-                print(f"  [{i}] {msg['len']}b: {msg.get('text','')[:300]}")
+                    top_p = sorted(pla.items(), key=lambda x: x[1])[:5]
+                    print(f"R{race_no} PLA ({len(pla)}): {top_p}")
+                ok += 1
+            else:
+                print(f"R{race_no}: no odds")
+
+        if ok > 0:
+            print(f"\nScraped {ok}/{len(races)} races successfully")
 
         await ctx.close()
 
