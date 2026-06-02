@@ -73,28 +73,45 @@ ODDS_PAGE = "https://bet.hkjc.com/en/racing/wp/{date_path}/{venue}/{race_no}"
 WS_HIJACK_SCRIPT = """
     window.__ws_instance = null;
     window.__ws_recv_raw = [];
-    window.__ws_odds_data = null;
+    window.__ws_odds_data = {};
+    window.__ws_sub_topic_map = {};  // corrId -> topic mapping
 
     const OrigWebSocket = window.WebSocket;
     window.WebSocket = function(...args) {
         const ws = new OrigWebSocket(...args);
         if (args[0] && args[0].includes('ueb.hkjc.com')) {
             window.__ws_instance = ws;
+            window.__ws_url = args[0];
 
             const origAddEventListener = ws.addEventListener.bind(ws);
             ws.addEventListener = function(type, handler, ...rest) {
                 if (type === 'message') {
                     const wrappedHandler = function(event) {
-                        let arr;
+                        let arr = null;
                         if (event.data instanceof ArrayBuffer) {
                             arr = Array.from(new Uint8Array(event.data));
                         } else if (typeof event.data === 'string') {
                             arr = Array.from(new TextEncoder().encode(event.data));
+                        } else if (event.data && typeof event.data === 'object' && event.data.constructor === Uint8Array) {
+                            arr = Array.from(event.data);
                         }
-                        if (arr) {
-                            const readable = arr.filter(b => b >= 32 && b < 127)
+                        if (arr && arr.length > 0) {
+                            const now = Date.now();
+                            // Full hex dump for analysis
+                            const hex = arr.map(b => (b < 16 ? '0' : '') + b.toString(16)).join(' ');
+                            // ASCII-readable text only
+                            const text = arr.filter(b => b >= 32 && b < 127)
                                 .map(b => String.fromCharCode(b)).join('');
-                            window.__ws_recv_raw.push({bytes: arr, text: readable});
+                            // Classify: ACK (0-50 bytes), data (50+ bytes)
+                            const cls = arr.length <= 50 ? 'ack' : 'data';
+                            window.__ws_recv_raw.push({
+                                ts: now,
+                                len: arr.length,
+                                cls: cls,
+                                bytes: arr,
+                                hex: hex,
+                                text: text
+                            });
                         }
                         return handler(event);
                     };
@@ -115,50 +132,184 @@ WS_HIJACK_SCRIPT = """
         const topicBytes = encoder.encode(topic);
         const topicLen = topicBytes.length;
 
+        const corrId1 = Math.floor(Math.random() * 256);
+        const corrId2 = Math.floor(Math.random() * 256);
+        window.__ws_sub_topic_map[corrId1] = topic;
+        window.__ws_sub_topic_map[corrId2] = topic;
+
+        // SMF subscribe: 2-part message (cache request + live sub)
         const msg = new Uint8Array(6 + 1 + topicLen + 6 + 1 + topicLen);
         let pos = 0;
+        // Part 1: Cache/last-value request (0xa2 0x49)
         msg[pos++] = 0xa2; msg[pos++] = 0x49;
-        msg[pos++] = 0x2d;
-        msg[pos++] = Math.floor(Math.random() * 256);
+        msg[pos++] = 0x2d;  // subscribe operation
+        msg[pos++] = corrId1;
         msg[pos++] = 0x00; msg[pos++] = 0x00;
         msg[pos++] = topicLen;
         for (let i = 0; i < topicBytes.length; i++) msg[pos++] = topicBytes[i];
+        // Part 2: Live subscription (0x82 0x4a)
         msg[pos++] = 0x82; msg[pos++] = 0x4a;
-        msg[pos++] = 0x2d;
-        msg[pos++] = Math.floor(Math.random() * 256);
+        msg[pos++] = 0x2d;  // subscribe operation
+        msg[pos++] = corrId2;
         msg[pos++] = 0x00; msg[pos++] = 0x00;
         msg[pos++] = topicLen;
         for (let i = 0; i < topicBytes.length; i++) msg[pos++] = topicBytes[i];
 
         ws.send(msg.buffer);
-        return 'sent';
+        return 'sent:' + corrId1 + ',' + corrId2;
+    };
+
+    // Helper: get captured data messages (skip ACKs)
+    window.__getDataMessages = function() {
+        return window.__ws_recv_raw.filter(m => m.cls === 'data');
+    };
+
+    // Helper: get message count by class
+    window.__getMessageStats = function() {
+        const stats = {total: window.__ws_recv_raw.length, ack: 0, data: 0};
+        for (const m of window.__ws_recv_raw) {
+            if (m.cls === 'ack') stats.ack++;
+            else stats.data++;
+        }
+        return stats;
     };
 """
 
 
-def _parse_ws_odds_messages(recv_messages: list) -> dict:
-    """Parse WebSocket received messages for odds data.
+def _parse_smf_header(msg_bytes: list) -> dict:
+    """Parse SMF (Solace Message Format) binary header.
 
-    Looks for Solace data frames that contain odds-like decimal numbers.
-    Returns merged WIN/PLA odds dicts keyed by runner number.
+    SMF header structure (minimal):
+      Byte 0-1: Frame marker (e.g. 0xa2 0x49 for cache-req, 0x82 0x4a for live-sub)
+      Byte 2:   Operation code (0x2d = subscribe, varies for data)
+      Byte 3:   Correlation ID
+      Byte 4-5: Flags/reserved
+      Byte 6:   Topic length (if present)
+      Byte 7+:  Topic bytes (if present)
+
+    Returns dict with parsed fields or None if not a valid SMF frame.
     """
-    win_odds = {}
-    place_odds = {}
+    if len(msg_bytes) < 7:
+        return None
+
+    header = {
+        "marker": f"{msg_bytes[0]:02x} {msg_bytes[1]:02x}",
+        "op": msg_bytes[2],
+        "corr_id": msg_bytes[3],
+        "flags": (msg_bytes[4], msg_bytes[5]),
+        "total_len": len(msg_bytes),
+    }
+
+    # Check if this looks like an SMF data frame
+    # Common patterns: 0xa2 0x49 = cache req, 0x82 0x4a = live sub
+    # Data frames might have different markers
+    if msg_bytes[0] in (0xa2, 0x82, 0x00, 0x01) and msg_bytes[1] in (0x49, 0x4a, 0x48, 0x4b):
+        header["is_smf"] = True
+    else:
+        header["is_smf"] = False
+
+    # Try to extract topic if this is a data message containing one
+    # Topic often starts at byte 6-7 with a length prefix
+    topic_len = msg_bytes[6] if len(msg_bytes) > 6 else 0
+    if topic_len > 0 and topic_len < 200 and 7 + topic_len <= len(msg_bytes):
+        try:
+            topic_bytes = bytes(msg_bytes[7:7 + topic_len])
+            topic = topic_bytes.decode("ascii", errors="replace")
+            if topic.startswith("hk/") and "/" in topic:
+                header["topic"] = topic
+                header["payload_start"] = 7 + topic_len
+        except Exception:
+            pass
+
+    return header
+
+
+def _parse_ws_odds_messages(recv_messages: list) -> dict:
+    """Parse WebSocket received messages for WIN/PLA odds data.
+
+    Each SMF data message contains:
+    - SMF header (7+ bytes)
+    - Topic (length-prefixed ASCII string)
+    - Payload: runner-number -> odds mappings in key=value format
+
+    Returns dict: {race_no: {win_odds: {runner_no: price}, place_odds: {runner_no: price}}}
+    """
+    import re
+
+    results = {}
 
     for msg in recv_messages:
-        text = msg.get("text", "")
-        if len(text) < 20:
+        if msg.get("cls") != "data":
             continue
 
-        # Solace odds payloads contain runner numbers and decimal odds
-        # The exact format depends on the Solace message encoding.
-        # For now, extract any decimal numbers that could be odds.
-        import re
-        numbers = re.findall(r'(\d+\.\d+)', text)
-        # Also look for integers that could be runner numbers
-        runners = re.findall(r'\b(\d{1,2})\b', text)
+        arr = msg.get("bytes", [])
+        text = msg.get("text", "")
+        msg_len = len(arr)
 
-    return {"win_odds": win_odds, "place_odds": place_odds}
+        if msg_len < 50 or len(text) < 20:
+            continue
+
+        # Parse SMF header
+        header = _parse_smf_header(arr)
+
+        # Determine topic (race_no + odds_type) from header or text
+        topic = header.get("topic", "") if header else ""
+        race_no = None
+        odds_type = None  # 'win' or 'pla'
+
+        # Try to extract topic info from the ASCII text
+        # Topic format: hk/d/prdt/wager/evt/01/upd/racing/{YYYYMMDD}/{venue}/{race_no}/{win|pla}/odds/full
+        topic_match = re.search(r'hk/[a-z/]*racing/\d+/\w+/(\d+)/(win|pla)/odds', text)
+        if topic_match:
+            race_no = int(topic_match.group(1))
+            odds_type = topic_match.group(2)
+
+        # Extract runner odds from payload
+        # The payload typically contains ASCII like "1=3.5,2=12.0,..." or similar
+        # Look for patterns: digit(s) followed by = or : then decimal number
+        odds_entries = re.findall(r'(\d{1,2})\s*[=:]\s*(\d+\.\d+)', text)
+        if not odds_entries:
+            # Try looser pattern: look for decimal numbers near small integers
+            decimals = re.findall(r'(\d+\.\d+)', text)
+            small_ints = re.findall(r'\b(\d{1,2})\b', text)
+            # Only match if counts are similar (one odds value per runner)
+            if len(decimals) == len(small_ints) and 4 <= len(decimals) <= 14:
+                odds_entries = list(zip(small_ints, decimals))
+            elif len(decimals) >= 4:
+                # Fallback: assign sequential runner numbers
+                odds_entries = [(str(i + 1), d) for i, d in enumerate(decimals[:14])]
+
+        if odds_entries and (race_no or odds_type):
+            # Infer race_no from topic text if not found
+            if not race_no:
+                race_match = re.search(r'/racing/\d+/\w+/(\d+)/', text)
+                if race_match:
+                    race_no = int(race_match.group(1))
+
+            if not odds_type:
+                if 'pla' in text.lower() or '/pla/' in text:
+                    odds_type = 'pla'
+                elif 'win' in text.lower() or '/win/' in text:
+                    odds_type = 'win'
+
+            if race_no:
+                if race_no not in results:
+                    results[race_no] = {"win_odds": {}, "place_odds": {}}
+
+                odds_dict = {}
+                for runner, price_str in odds_entries:
+                    try:
+                        odds_dict[str(int(runner))] = float(price_str)
+                    except (ValueError, TypeError):
+                        pass
+
+                if odds_dict:
+                    if odds_type == 'pla':
+                        results[race_no]["place_odds"].update(odds_dict)
+                    else:
+                        results[race_no]["win_odds"].update(odds_dict)
+
+    return results
 
 
 def _extract_meeting_info(data: dict, date_str: str, venue: str) -> dict | None:
@@ -276,37 +427,31 @@ async def _subscribe_odds(page, races: list[dict], date_str: str, venue: str) ->
 
 
 async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> dict:
-    """Wait for WebSocket odds data and extract per-race WIN/PLA odds.
+    """Wait for WebSocket odds data, parse SMF messages, return per-race odds.
 
-    Returns dict of race_id -> {win_odds: {}, place_odds: {}}
+    Returns dict of race_no -> {win_odds: {runner: price}, place_odds: {runner: price}}
     """
-    results = {}
-
-    # Wait for WebSocket data to arrive
     await asyncio.sleep(wait_seconds)
 
-    # Get all received messages
-    messages = await page.evaluate("() => window.__ws_recv_raw")
+    # Get message stats from browser
+    stats = await page.evaluate("() => window.__getMessageStats()")
+    logger.debug(f"WS messages: {stats['total']} total, {stats['data']} data, {stats['ack']} ACKs")
 
-    if not messages:
-        logger.debug("No WebSocket messages received")
-        return results
+    if stats["data"] == 0:
+        logger.debug("No WebSocket data messages received yet")
+        return {}
 
-    # Parse messages for odds data
-    import re
+    # Get all received messages (data only to save transfer)
+    messages = await page.evaluate("() => window.__getDataMessages()")
 
-    for msg in messages:
-        text = msg.get("text", "")
-        byte_len = len(msg.get("bytes", []))
+    # Parse odds from messages
+    results = _parse_ws_odds_messages(messages)
 
-        # Skip ACK messages (short)
-        if byte_len < 50:
-            continue
-
-        # Try to find odds data in the message
-        # Solace messages contain topic info and payload
-        # Look for venue+race patterns and decimal odds
-        logger.debug(f"WS data: {len(msg['bytes'])} bytes, text: {text[:200]}")
+    if not results:
+        # Dump first few messages for debugging
+        for i, msg in enumerate(messages[:3]):
+            logger.debug(f"  msg[{i}]: {msg['len']} bytes, text: {msg.get('text', '')[:200]}")
+        logger.debug("Could not parse odds from messages — see text dumps above")
 
     return results
 
@@ -314,36 +459,55 @@ async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> d
 async def _hkjc_login(page, context) -> bool:
     """Log into HKJC betting account via SPA's ForgeRock SSO flow.
 
-    The HKJC SPA uses ForgeRock AM with 2FA (SMS OTP). This function:
-    1. Checks if already authenticated (SSO check)
-    2. Fills username/password in the SPA login form
-    3. Triggers login via the SPA's own JavaScript
-    4. If OTP is required, submits the OTP from env or prompts user
-    5. Returns True on successful SSO sign-in
+    Handles both trusted-browser (fast path, no OTP) and OTP flows.
+    Trust-browser dialog is handled with Playwright native clicks.
     """
     account = os.getenv("HKJC_ACCOUNT", "")
     password = os.getenv("HKJC_PASSWORD", "")
-    otp_code = os.getenv("HKJC_OTP", "")  # pre-provided OTP if available
+    otp_code = os.getenv("HKJC_OTP", "")
 
     if not account or not password or account == "YOUR_ACCOUNT_ID":
         logger.debug("No HKJC credentials set — skipping login")
         return False
 
-    # Quick check: are we already authenticated?
+    # Quick SSO check
     try:
         resp = await page.request.post(
             "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
             headers={"Content-Type": "application/json"},
             data='{"knownWebID":"","knownSSOGUID":"","isNew":true}',
         )
-        sso = await resp.text()
-        if "SSO_SIGN_IN" in sso and "NOT_SIGN_IN" not in sso:
-            logger.info("HKJC: already authenticated")
-            return True
+        sso_text = await resp.text()
+        sso = json.loads(sso_text)
+        for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
+            if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
+                logger.info("HKJC: already authenticated")
+                return True
     except Exception:
         pass
 
     logger.info("Logging into HKJC (ForgeRock SSO)...")
+
+    # ForgeRock state tracking
+    got_token = False
+    otp_needed = False
+    trust_stage = False
+
+    async def on_response(response):
+        nonlocal got_token, otp_needed, trust_stage
+        if "auth.ark.hkjc.com" in response.url and "authenticate" in response.url:
+            try:
+                data = json.loads(await response.text())
+                if data.get("tokenId"):
+                    got_token = True
+                if data.get("stage") == "otp":
+                    otp_needed = True
+                elif data.get("stage") == "trust-browser-confirm":
+                    trust_stage = True
+            except Exception:
+                pass
+
+    page.on("response", on_response)
 
     try:
         # Load login page
@@ -357,7 +521,7 @@ async def _hkjc_login(page, context) -> bool:
             logger.debug("No login form — may already be authenticated")
             return True
 
-        # Fill credentials using native setter + React events
+        # Fill credentials
         logger.debug("Filling credentials...")
         await page.evaluate(f"""
             () => {{
@@ -376,85 +540,118 @@ async def _hkjc_login(page, context) -> bool:
         """)
         await asyncio.sleep(1)
 
-        # Trigger login by pressing Enter on password field
-        # (the SPA handles the entire ForgeRock flow via its own JS)
+        # Submit credentials
         await page.focus("#login-password-input")
         await page.keyboard.press("Enter")
-        await asyncio.sleep(5)
 
-        # Check if OTP input appeared (stage=otp — 6 single-digit boxes)
-        otp_boxes = await page.evaluate("""() => {
-            const inputs = document.querySelectorAll('input.otp-input, [class*="otp"] input[type="number"]');
-            if (inputs.length >= 4) {
-                return inputs.length;
-            }
-            return 0;
-        }""")
+        # Wait for ForgeRock response
+        for i in range(30):
+            await asyncio.sleep(1)
+            if got_token:
+                break
+            if otp_needed:
+                break
 
-        if otp_boxes:
-            logger.info(f"OTP required — {otp_boxes} digit boxes detected")
+        # PATH A: Trusted browser — token received directly
+        if got_token and not otp_needed:
+            logger.info("Trusted browser: token received, establishing SSO...")
+            for i in range(20):
+                await asyncio.sleep(1)
+                try:
+                    resp = await page.request.post(
+                        "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+                        headers={"Content-Type": "application/json"},
+                        data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
+                    sso = json.loads(await resp.text())
+                    for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
+                        if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
+                            logger.success("HKJC login successful (trusted browser)!")
+                            return True
+                except Exception:
+                    pass
+            logger.warning("Token received but SSO not established")
+            return False
 
-            if not otp_code:
-                logger.error("HKJC_OTP not set in .env — cannot complete 2FA")
+        # PATH B: OTP required
+        if otp_needed and not got_token:
+            if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
+                logger.error("HKJC_OTP not set or invalid in .env — cannot complete 2FA")
                 return False
 
-            if len(otp_code) != otp_boxes:
-                logger.warning(f"OTP length ({len(otp_code)}) != boxes ({otp_boxes}), truncating")
+            # Check OTP boxes
+            await asyncio.sleep(2)
+            boxes = await page.query_selector_all("input.otp-input")
+            logger.info(f"OTP required — {len(boxes)} boxes, filling...")
 
-            logger.debug("Filling OTP digits via native events...")
-            await page.evaluate(f"""
-                () => {{
-                    const boxes = document.querySelectorAll('input.otp-input, [class*="otp"] input[type="number"]');
-                    const digits = '{otp_code}';
-                    for (let i = 0; i < Math.min(digits.length, boxes.length); i++) {{
-                        const ns = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        ns.call(boxes[i], digits[i]);
-                        boxes[i].dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        boxes[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    }}
-                }}
-            """)
-            await asyncio.sleep(0.5)
+            if len(boxes) >= 4:
+                # Type OTP via real keyboard
+                for i, digit in enumerate(otp_code[:len(boxes)]):
+                    await boxes[i].click()
+                    await page.keyboard.type(digit)
+                    await asyncio.sleep(0.03)
+                logger.debug("OTP typed via keyboard")
 
-            # Click submit/next after OTP
-            submitted = await page.evaluate("""() => {
-                const btns = document.querySelectorAll('button, [role="button"], input[type="submit"]');
-                for (const b of btns) {
-                    const t = (b.innerText || b.value || '').trim().toUpperCase();
-                    if (['NEXT', 'SUBMIT', 'VERIFY', 'CONFIRM', 'LOGIN', 'LOG IN', 'OK'].includes(t) && !b.disabled) {
-                        b.click();
-                        return 'clicked: ' + t;
-                    }
-                }
-                // Try pressing Enter on last OTP box
-                const boxes = document.querySelectorAll('input.otp-input');
-                if (boxes.length > 0) {
-                    boxes[boxes.length - 1].dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
-                    return 'enter on last box';
-                }
-                return 'no submit found';
-            }""")
-            logger.debug(f"OTP submit: {submitted}")
-            await asyncio.sleep(3)
-        else:
-            logger.debug("No OTP prompt detected — login may be password-only")
+                # Wait for trust-browser or token
+                for i in range(15):
+                    await asyncio.sleep(1)
+                    if got_token:
+                        break
+                    if trust_stage:
+                        break
 
-        # Verify SSO after login
-        await asyncio.sleep(3)
-        resp = await page.request.post(
-            "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
-            headers={"Content-Type": "application/json"},
-            data='{"knownWebID":"","knownSSOGUID":"","isNew":true}',
-        )
-        sso = await resp.text()
+                # Handle trust-browser dialog
+                if trust_stage and not got_token:
+                    logger.debug("Trust-browser dialog detected, clicking Trust + Next...")
+                    await asyncio.sleep(3)
 
-        if "SSO_SIGN_IN" in sso and "NOT_SIGN_IN" not in sso:
-            logger.success("HKJC login successful!")
-            return True
-        else:
-            logger.warning(f"HKJC login failed. SSO: {sso[:200]}")
-            return False
+                    # Click "Trust this browser"
+                    try:
+                        btn = await page.query_selector('#notTrustButton')
+                        if btn:
+                            await btn.click(force=True)
+                            logger.debug("  Clicked Trust option")
+                    except Exception as e:
+                        logger.debug(f"  Trust click: {e}")
+
+                    await asyncio.sleep(1)
+
+                    # Click Next
+                    try:
+                        next_btn = await page.query_selector('.trustbrowser-btn-group')
+                        if next_btn:
+                            await next_btn.click(force=True)
+                            logger.debug("  Clicked Next")
+                    except Exception as e:
+                        logger.debug(f"  Next click: {e}")
+
+                    # Wait for token
+                    for i in range(20):
+                        await asyncio.sleep(1)
+                        if got_token:
+                            break
+
+                if got_token:
+                    # Wait for SSO establishment
+                    for i in range(20):
+                        await asyncio.sleep(1)
+                        try:
+                            resp = await page.request.post(
+                                "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+                                headers={"Content-Type": "application/json"},
+                                data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
+                            sso = json.loads(await resp.text())
+                            for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
+                                if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
+                                    logger.success("HKJC login successful (OTP + trust)!")
+                                    return True
+                        except Exception:
+                            pass
+                else:
+                    logger.warning("OTP submitted but no token received")
+                    return False
+
+        logger.warning(f"HKJC login failed: got_token={got_token} otp={otp_needed}")
+        return False
 
     except Exception as e:
         logger.error(f"HKJC login error: {e}")
@@ -543,15 +740,14 @@ async def main():
         logger.debug("Subscribing to WIN/PLA odds via Solace...")
         await _subscribe_odds(page, races_to_scrape, args.date, args.venue)
 
-        # Phase 4: Wait for and collect odds data
-        await _collect_ws_odds(page, races_to_scrape, wait_seconds=10)
+        # Phase 4: Collect odds data from WebSocket
+        parsed_odds = await _collect_ws_odds(page, races_to_scrape, wait_seconds=10)
 
-        # Phase 5: Check if we got any odds
-        # For now, extract what we can from WebSocket messages
-        ws_messages = await page.evaluate("() => window.__ws_recv_raw")
-        ws_data_count = len([m for m in ws_messages if len(m.get("bytes", [])) > 50])
+        # Phase 5: Save parsed odds to database
+        # Get raw messages for debugging if parsing failed
+        stats = await page.evaluate("() => window.__getMessageStats()")
 
-        if ws_data_count == 0:
+        if stats["data"] == 0:
             logger.warning(
                 "No WIN/PLA odds received via WebSocket. "
                 "This is expected if races haven't opened for betting yet. "
@@ -560,28 +756,25 @@ async def main():
 
         ok = 0
         for r in races_to_scrape:
-            # Try to extract any available odds for this race
-            win_odds = {}
-            place_odds = {}
+            race_no = r["race_no"]
+            race_odds = parsed_odds.get(race_no, {})
 
-            # Check WebSocket messages for this race's odds
-            for msg in ws_messages:
-                text = msg.get("text", "")
-                if len(text) < 50:
-                    continue
-                race_str = f"R{r['race_no']}" if f"R{r['race_no']}" in text else None
+            win_odds = race_odds.get("win_odds", {})
+            place_odds = race_odds.get("place_odds", {})
 
-            # If we got any odds data, save it
             if win_odds:
                 save_odds_snapshot(r["race_id"], win_odds, place_odds)
                 top3 = sorted(win_odds.items(), key=lambda x: x[1])[:3]
-                logger.info(f"R{r['race_no']}: {len(win_odds)} horses — favs: {top3}")
+                logger.info(f"R{race_no}: {len(win_odds)} horses WIN — favs: {top3}")
+                if place_odds:
+                    top3p = sorted(place_odds.items(), key=lambda x: x[1])[:3]
+                    logger.info(f"R{race_no}: {len(place_odds)} horses PLA — favs: {top3p}")
                 ok += 1
 
                 if args.audit:
                     mins = _minutes_to_jump(r.get("jump_time", "13:00"))
                     if mins is not None and 10 <= mins <= 20:
-                        logger.info(f"R{r['race_no']}: T-{mins}min — triggering audit...")
+                        logger.info(f"R{race_no}: T-{mins}min — triggering audit...")
                         audit_script = str(Path(__file__).parent / "audit.py")
                         proc = subprocess.Popen(
                             [sys.executable, audit_script, "--race-id", r["race_id"]],
@@ -589,11 +782,17 @@ async def main():
                         )
                         logger.info(f"Audit PID {proc.pid} spawned for {r['race_id']}")
             else:
-                logger.debug(f"R{r['race_no']}: no WIN/PLA odds available yet")
+                logger.debug(f"R{race_no}: no WIN/PLA odds available yet")
 
         if ok > 0:
-            logger.success(f"Odds scrape: {ok}/{len(races_to_scrape)} races with live odds")
+            logger.success(f"Odds scrape: {ok}/{len(races_to_scrape)} races with live odds ({stats['data']} WS data msgs, {stats['ack']} ACKs)")
         else:
+            # Dump sample data messages for debugging
+            data_msgs = await page.evaluate("() => window.__getDataMessages()")
+            if data_msgs:
+                logger.debug(f"No odds parsed. {len(data_msgs)} data messages. Sample texts:")
+                for i, msg in enumerate(data_msgs[:3]):
+                    logger.debug(f"  [{i}] {msg['len']}b: {msg.get('text','')[:250]}")
             logger.info(f"No live odds captured ({len(races_to_scrape)} races) — "
                         f"pools may not be open yet or races already finished")
 
