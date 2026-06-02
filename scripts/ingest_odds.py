@@ -74,12 +74,13 @@ WS_HIJACK_SCRIPT = """
     window.__ws_instance = null;
     window.__ws_recv_raw = [];
     window.__ws_odds_data = {};
-    window.__ws_sub_topic_map = {};  // corrId -> topic mapping
+    window.__ws_sub_topic_map = {};
 
     const OrigWebSocket = window.WebSocket;
     window.WebSocket = function(...args) {
         const ws = new OrigWebSocket(...args);
         if (args[0] && args[0].includes('ueb.hkjc.com')) {
+            // Always update to the LATEST Solace WS instance
             window.__ws_instance = ws;
             window.__ws_url = args[0];
 
@@ -422,8 +423,18 @@ async def _subscribe_odds(page, races: list[dict], date_str: str, venue: str) ->
         race_no = r["race_no"]
         for odds_type in ["win", "pla"]:
             topic = f"hk/d/prdt/wager/evt/01/upd/racing/{dt_compact}/{venue}/{race_no}/{odds_type}/odds/full"
-            result = await page.evaluate(f"window.__sendSolaceSubscribe('{topic}')")
-            logger.debug(f"Solace sub R{race_no} {odds_type}: {result}")
+            # Retry on 'not_ready' (WebSocket still opening or busy)
+            for attempt in range(10):
+                result = await page.evaluate(f"window.__sendSolaceSubscribe('{topic}')")
+                if result == "not_ready":
+                    await asyncio.sleep(0.3)
+                else:
+                    break
+            if result == "not_ready":
+                logger.warning(f"Solace sub R{race_no} {odds_type}: failed after 10 retries")
+            else:
+                logger.debug(f"Solace sub R{race_no} {odds_type}: {result}")
+            await asyncio.sleep(0.05)
 
 
 async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> dict:
