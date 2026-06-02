@@ -29,6 +29,7 @@ from playwright.async_api import async_playwright
 from loguru import logger
 from config import BASE_DIR, DATA_DIR
 from db import init_db, save_odds_snapshot, get_race_ids_for_date, get_racecard, is_race_day, get_venue_for_date
+from notify import send_telegram_sync
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -587,6 +588,12 @@ async def _hkjc_login(page, context) -> bool:
         if otp_needed and not got_token:
             if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
                 logger.error("HKJC_OTP not set or invalid in .env — cannot complete 2FA")
+                # Rate-limited alert: max once per 30 min
+                alert_file = Path("/tmp/hkjc_otp_alerted")
+                now = datetime.now()
+                if not alert_file.exists() or (now - datetime.fromtimestamp(alert_file.stat().st_mtime)).seconds > 1800:
+                    send_telegram_sync("HKJC OTP NEEDED — trust cookie expired. Update HKJC_OTP in .env and restart cp-odds.")
+                    alert_file.write_text(now.isoformat())
                 return False
 
             # Check OTP boxes
@@ -654,6 +661,7 @@ async def _hkjc_login(page, context) -> bool:
                             for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
                                 if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
                                     logger.success("HKJC login successful (OTP + trust)!")
+                                    send_telegram_sync("HKJC login OK — trust cookie renewed for 24h")
                                     return True
                         except Exception:
                             pass
@@ -662,6 +670,7 @@ async def _hkjc_login(page, context) -> bool:
                     return False
 
         logger.warning(f"HKJC login failed: got_token={got_token} otp={otp_needed}")
+        send_telegram_sync(f"HKJC login FAILED — token={got_token} otp_needed={otp_needed}")
         return False
 
     except Exception as e:
