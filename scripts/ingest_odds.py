@@ -552,14 +552,15 @@ async def _collect_ws_odds(page, races: list[dict], wait_seconds: int = 10) -> d
 
 
 async def _hkjc_login(page, context) -> bool:
-    """Log into HKJC betting account via SPA's ForgeRock SSO flow.
+    """Restore HKJC SSO session from state file, or perform full login.
 
-    Handles both trusted-browser (fast path, no OTP) and OTP flows.
-    Trust-browser dialog is handled with Playwright native clicks.
+    Priority:
+    1. Check if already authenticated via SSO endpoint
+    2. Try restoring cookies from data/session_state.json
+    3. Fall back to full ForgeRock login flow (requires OTP)
     """
     account = os.getenv("HKJC_ACCOUNT", "")
     password = os.getenv("HKJC_PASSWORD", "")
-    otp_code = os.getenv("HKJC_OTP", "")
 
     if not account or not password or account == "YOUR_ACCOUNT_ID":
         logger.debug("No HKJC credentials set — skipping login")
@@ -572,8 +573,7 @@ async def _hkjc_login(page, context) -> bool:
             headers={"Content-Type": "application/json"},
             data='{"knownWebID":"","knownSSOGUID":"","isNew":true}',
         )
-        sso_text = await resp.text()
-        sso = json.loads(sso_text)
+        sso = json.loads(await resp.text())
         for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
             if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
                 logger.info("HKJC: already authenticated")
@@ -581,9 +581,41 @@ async def _hkjc_login(page, context) -> bool:
     except Exception:
         pass
 
-    logger.info("Logging into HKJC (ForgeRock SSO)...")
+    # Try restoring from state file
+    state_file = BASE_DIR / "data" / "session_state.json"
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text())
+            cookies = state.get("cookies", [])
+            if cookies:
+                await context.add_cookies(cookies)
+                logger.info(f"Restored {len(cookies)} cookies from {state_file}")
+                await asyncio.sleep(0.5)
+                # Re-check SSO
+                try:
+                    resp = await page.request.post(
+                        "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+                        headers={"Content-Type": "application/json"},
+                        data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
+                    sso = json.loads(await resp.text())
+                    for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
+                        if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
+                            logger.info("HKJC: session restored from state file")
+                            return True
+                except Exception:
+                    pass
+                logger.debug("State file cookies expired — need fresh login")
+        except Exception as e:
+            logger.warning(f"Failed to restore state: {e}")
 
-    # ForgeRock state tracking
+    # State restore failed — perform full login with OTP
+    otp_code = os.getenv("HKJC_OTP", "")
+    if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
+        logger.warning("No valid HKJC_OTP in .env — cannot perform fresh login")
+        return False
+
+    logger.info("Performing fresh HKJC login with OTP...")
+
     got_token = False
     otp_needed = False
     trust_stage = False
@@ -605,18 +637,15 @@ async def _hkjc_login(page, context) -> bool:
     page.on("response", on_response)
 
     try:
-        # Load login page
         await page.goto("https://bet.hkjc.com/en/racing/login",
                         wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
 
-        # Check if login form exists
         account_input = await page.query_selector("#login-account-input")
         if not account_input:
             logger.debug("No login form — may already be authenticated")
             return True
 
-        # Fill credentials
         logger.debug("Filling credentials...")
         await page.evaluate(f"""
             () => {{
@@ -634,131 +663,117 @@ async def _hkjc_login(page, context) -> bool:
             }}
         """)
         await asyncio.sleep(1)
-
-        # Submit credentials
         await page.focus("#login-password-input")
         await page.keyboard.press("Enter")
 
-        # Wait for ForgeRock response
         for i in range(30):
             await asyncio.sleep(1)
-            if got_token:
-                break
-            if otp_needed:
+            if got_token or otp_needed:
                 break
 
-        # PATH A: Trusted browser — token received directly
         if got_token and not otp_needed:
             logger.info("Trusted browser: token received, establishing SSO...")
-            for i in range(20):
-                await asyncio.sleep(1)
-                try:
-                    resp = await page.request.post(
-                        "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
-                        headers={"Content-Type": "application/json"},
-                        data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
-                    sso = json.loads(await resp.text())
-                    for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
-                        if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
-                            logger.success("HKJC login successful (trusted browser)!")
-                            return True
-                except Exception:
-                    pass
-            logger.warning("Token received but SSO not established")
-            return False
+            await _wait_for_sso(page)
+            return True
 
-        # PATH B: OTP required
         if otp_needed and not got_token:
-            if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
-                logger.error("HKJC_OTP not set or invalid in .env — cannot complete 2FA")
-                # Rate-limited alert: max once per 30 min
-                alert_file = Path("/tmp/hkjc_otp_alerted")
-                now = datetime.now()
-                if not alert_file.exists() or (now - datetime.fromtimestamp(alert_file.stat().st_mtime)).seconds > 1800:
-                    send_telegram_sync("HKJC OTP NEEDED — trust cookie expired. Update HKJC_OTP in .env and restart cp-odds.")
-                    alert_file.write_text(now.isoformat())
-                return False
-
-            # Check OTP boxes
             await asyncio.sleep(2)
             boxes = await page.query_selector_all("input.otp-input")
             logger.info(f"OTP required — {len(boxes)} boxes, filling...")
 
             if len(boxes) >= 4:
-                # Type OTP via real keyboard
-                for i, digit in enumerate(otp_code[:len(boxes)]):
-                    await boxes[i].click()
-                    await page.keyboard.type(digit)
-                    await asyncio.sleep(0.03)
-                logger.debug("OTP typed via keyboard")
+                # Fill OTP via JS (more reliable than keyboard.type)
+                await page.evaluate(f"""
+                    () => {{
+                        const boxes = document.querySelectorAll('input.otp-input');
+                        const digits = '{otp_code}';
+                        for (let i = 0; i < Math.min(digits.length, boxes.length); i++) {{
+                            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                            ns.call(boxes[i], digits[i]);
+                            boxes[i].dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            boxes[i].dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                    }}
+                """)
+                await asyncio.sleep(0.5)
+                try:
+                    last_box = await page.query_selector("input.otp-input:last-of-type")
+                    if last_box:
+                        await last_box.press("Enter")
+                except:
+                    pass
+                logger.debug("OTP submitted")
 
-                # Wait for trust-browser or token
                 for i in range(15):
                     await asyncio.sleep(1)
-                    if got_token:
-                        break
-                    if trust_stage:
+                    if got_token or trust_stage:
                         break
 
-                # Handle trust-browser dialog
                 if trust_stage and not got_token:
-                    logger.debug("Trust-browser dialog detected, clicking Trust + Next...")
-                    await asyncio.sleep(3)
-
-                    # Click "Trust this browser"
+                    logger.debug("Trust-browser dialog, clicking Trust + Next...")
+                    await asyncio.sleep(2)
                     try:
-                        btn = await page.query_selector('#notTrustButton')
+                        btn = await page.query_selector("#notTrustButton")  # Trust this browser
                         if btn:
                             await btn.click(force=True)
-                            logger.debug("  Clicked Trust option")
-                    except Exception as e:
-                        logger.debug(f"  Trust click: {e}")
-
+                    except:
+                        pass
                     await asyncio.sleep(1)
-
-                    # Click Next
                     try:
-                        next_btn = await page.query_selector('.trustbrowser-btn-group')
-                        if next_btn:
-                            await next_btn.click(force=True)
-                            logger.debug("  Clicked Next")
-                    except Exception as e:
-                        logger.debug(f"  Next click: {e}")
-
-                    # Wait for token
+                        next_div = await page.query_selector("#next")
+                        if next_div:
+                            await next_div.click(force=True)
+                    except:
+                        pass
                     for i in range(20):
                         await asyncio.sleep(1)
                         if got_token:
                             break
 
                 if got_token:
-                    # Wait for SSO establishment
-                    for i in range(20):
-                        await asyncio.sleep(1)
-                        try:
-                            resp = await page.request.post(
-                                "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
-                                headers={"Content-Type": "application/json"},
-                                data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
-                            sso = json.loads(await resp.text())
-                            for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
-                                if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
-                                    logger.success("HKJC login successful (OTP + trust)!")
-                                    send_telegram_sync("HKJC login OK — trust cookie renewed for 24h")
-                                    return True
-                        except Exception:
-                            pass
+                    await _wait_for_sso(page)
+
+                    # Save state for future runs
+                    try:
+                        await page.goto("https://bet.hkjc.com/en/racing", timeout=30000)
+                        await asyncio.sleep(3)
+                        state = await context.storage_state()
+                        state_file.parent.mkdir(parents=True, exist_ok=True)
+                        state_file.write_text(json.dumps(state, indent=2))
+                        logger.info(f"Session state saved ({len(state.get('cookies', []))} cookies)")
+                    except Exception as e:
+                        logger.warning(f"Failed to save state: {e}")
+
+                    return True
                 else:
                     logger.warning("OTP submitted but no token received")
                     return False
 
         logger.warning(f"HKJC login failed: got_token={got_token} otp={otp_needed}")
-        send_telegram_sync(f"HKJC login FAILED — token={got_token} otp_needed={otp_needed}")
         return False
 
     except Exception as e:
         logger.error(f"HKJC login error: {e}")
         return False
+
+
+async def _wait_for_sso(page) -> bool:
+    """Wait for SSO session to be established after ForgeRock token."""
+    for i in range(20):
+        await asyncio.sleep(1)
+        try:
+            resp = await page.request.post(
+                "https://txn01.hkjc.com/BetslipIB/services/SSOService.svc/DoCheckSSOSignInStatusTR",
+                headers={"Content-Type": "application/json"},
+                data='{"knownWebID":"","knownSSOGUID":"","isNew":true}')
+            sso = json.loads(await resp.text())
+            for item in sso.get("DoCheckSSOSignInStatusTRResult", []):
+                if item["Key"] == "sso_sign_in_level" and item["Value"] != "0":
+                    logger.success("HKJC login successful!")
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 async def main():

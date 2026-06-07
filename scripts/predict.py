@@ -248,12 +248,17 @@ def predict_race(race_id: str, lgb_model, xgb_model, cat_model, features,
     df["value_edge"] = (df["pred_prob"] - df["implied_prob_norm"]) / df["implied_prob_norm"].clip(lower=0.01)
     df["market_prob"] = market_probs
 
+    # ── Odds quality check ─────────────────────────────────────────────────
+    odds_defaulted = (df["win_odds"] == 10.0).all()
+    if odds_defaulted:
+        logger.warning(f"{race_id}: ALL odds defaulted (10.0) — skipping, no real market data")
+        return None
+
     save_predictions(race_id, df)
 
     # ── Bet signal ──────────────────────────────────────────────────────────
     track_cond = rc.get("track_condition", "Good").upper()
     wet = any(w in track_cond for w in ("WET", "SOFT", "YIELDING", "HEAVY", "SLOW"))
-    odds_defaulted = (df["win_odds"] == 10.0).all()
 
     value = df[(df["win_odds"] >= 4.0) & (df["win_odds"] <= 15.0) & (df["pure_ev"] > 1.05) & (df["rank"] <= 4)]
     bet = None
@@ -358,7 +363,10 @@ def main():
             logger.error(f"{rid}: prediction failed — {e}")
 
     bets = [r for r in results if r["bet"]]
-    logger.success(f"Done: {len(results)} races predicted, {len(bets)} bets flagged")
+    if not results:
+        logger.warning(f"No predictions generated — odds may not be available yet. Check cp-odds.")
+    else:
+        logger.success(f"Done: {len(results)} races predicted, {len(bets)} bets flagged")
 
 
 if __name__ == "__main__":

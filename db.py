@@ -230,13 +230,26 @@ def get_race_ids_for_date(date: str, venue: str = None) -> list[str]:
 # ── Odds helpers ──
 
 def save_odds_snapshot(race_id: str, win_odds: dict, place_odds: dict):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO odds_snapshots (race_id, timestamp, win_odds_json, place_odds_json) VALUES (?,?,?,?)",
-        (race_id, datetime.now().isoformat(), json.dumps(win_odds), json.dumps(place_odds))
-    )
-    conn.commit()
-    conn.close()
+    """Save odds snapshot with retry on DB lock (concurrent cp-odds + cp-predict)."""
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO odds_snapshots (race_id, timestamp, win_odds_json, place_odds_json) VALUES (?,?,?,?)",
+                (race_id, datetime.now().isoformat(), json.dumps(win_odds), json.dumps(place_odds))
+            )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 4:
+                import time as _time
+                _time.sleep(0.5 * (attempt + 1))
+            else:
+                raise
+        finally:
+            if conn:
+                conn.close()
 
 def get_latest_odds(race_id: str) -> dict:
     conn = get_db()
@@ -394,21 +407,34 @@ def get_market_microstructure(race_id: str) -> dict:
 # ── Prediction helpers ──
 
 def save_predictions(race_id: str, df):
-    conn = get_db()
-    now = datetime.now().isoformat()
-    for _, row in df.iterrows():
-        conn.execute(
-            """INSERT OR REPLACE INTO predictions
-               (race_id, horse_no, pred_prob, model_prob_pure, fair_odds, pure_ev,
-                value_edge, market_prob, win_odds, ensemble_score, rank, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (race_id, str(row["horse_no"]), float(row.get("pred_prob", 0)), float(row.get("model_prob_pure", 0)),
-             float(row.get("fair_odds", 0)), float(row.get("pure_ev", 0)), float(row.get("value_edge", 0)),
-             float(row.get("market_prob", 0)), float(row.get("win_odds", 0)),
-             float(row.get("ensemble_score", 0)), int(row.get("rank", 99)), now)
-        )
-    conn.commit()
-    conn.close()
+    """Save predictions with retry on DB lock (concurrent cp-odds + cp-predict)."""
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = get_db()
+            now = datetime.now().isoformat()
+            for _, row in df.iterrows():
+                conn.execute(
+                    """INSERT OR REPLACE INTO predictions
+                       (race_id, horse_no, pred_prob, model_prob_pure, fair_odds, pure_ev,
+                        value_edge, market_prob, win_odds, ensemble_score, rank, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (race_id, str(row["horse_no"]), float(row.get("pred_prob", 0)), float(row.get("model_prob_pure", 0)),
+                     float(row.get("fair_odds", 0)), float(row.get("pure_ev", 0)), float(row.get("value_edge", 0)),
+                     float(row.get("market_prob", 0)), float(row.get("win_odds", 0)),
+                     float(row.get("ensemble_score", 0)), int(row.get("rank", 99)), now)
+                )
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < 4:
+                import time as _time
+                _time.sleep(0.5 * (attempt + 1))
+            else:
+                raise
+        finally:
+            if conn:
+                conn.close()
 
 def get_predictions(race_id: str) -> list[dict]:
     conn = get_db()
